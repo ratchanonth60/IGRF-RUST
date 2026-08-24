@@ -1,0 +1,22 @@
+[package]
+name = "igrf-app"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "igrf-app"
+path = "src/main.rs"
+
+[dependencies]
+eframe = { version = "0.36.1", default-features = false, features = ["glow", "default_fonts"] }
+# Human-readable local timestamps in the CSV, matching the C# logger.
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+egui_plot = "0.37.0"
+igrf-core = { path = "../igrf-core" }
+igrf-io = { path = "../igrf-io" }
+serialport = "4.9"
+
+# Windowing backends are platform specific: asking for x11 on Windows fails to
+# build, and leaving both off on Linux leaves eframe with no backend at all.
+[target.'cfg(unix)'.dependencies]
+eframe = { version = "0.36.1", default-features = false, features = ["glow", "default_fonts", "x11", "wayland"] }

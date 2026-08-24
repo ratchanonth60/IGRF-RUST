@@ -1,0 +1,11 @@
+[package]
+name = "igrf-io"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Local-date rotation for the CSV logger; "clock" is the cross-platform
+# local-time source, so this works the same on Windows and Linux.
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+igrf-core = { path = "../igrf-core" }
+serialport = "4.9"

@@ -1,0 +1,44 @@
+{
+  "PidX": {
+    "Kp": 0.3,
+    "Ki": 0.0679,
+    "Kd": 0.239,
+    "MaxOutput": 10000.0,
+    "MinOutput": -10000.2,
+    "Setpoint": 0.0
+  },
+  "PidY": {
+    "Kp": 0.37,
+    "Ki": 0.07,
+    "Kd": 0.02,
+    "MaxOutput": 10000.0,
+    "MinOutput": -10000.0,
+    "Setpoint": 0.0
+  },
+  "PidZ": {
+    "Kp": 0.4,
+    "Ki": 0.1,
+    "Kd": 0.02,
+    "MaxOutput": 100000.0,
+    "MinOutput": -10000.0,
+    "Setpoint": 0.0
+  },
+  "FilterX": {
+    "Q": 1.0,
+    "R": 500.0
+  },
+  "FilterY": {
+    "Q": 1.0,
+    "R": 200.0
+  },
+  "FilterZ": {
+    "Q": 1.0,
+    "R": 150.0
+  },
+  "Sensor2Ip": "192.168.124.41",
+  "Sensor2Port": 12345,
+  "SensorPort": "/dev/ttyUSB0",
+  "SensorBaud": 9600,
+  "ControllerPort": "/dev/ttyACM0",
+  "ControllerBaud": 9600
+}

@@ -1,0 +1,3 @@
+[workspace]
+members = ["igrf-core", "igrf-io", "igrf-app"]
+resolver = "2"

@@ -1,0 +1,6 @@
+/target/
+/logs/*.csv
+/sensor_log.csv
+/SystemConfig.json
+*.json.tmp
+.DS_Store

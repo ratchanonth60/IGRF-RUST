@@ -25,6 +25,15 @@ cargo build --release --package igrf-app
 
 The release binary is `target/release/igrf-app`.
 
+## Automatic GitHub releases
+
+Every push to `main` runs the checks and creates a GitHub Release containing
+the Linux binary and its SHA-256 file. Tags use
+`v<igrf-app-version>-main.<run-id>`; for example, `v0.1.0-main.123456789`.
+
+Change the version in `igrf-app/Cargo.toml` when you want the next release
+line, then push to `main`.
+
 ## Release versioning
 
 The first release is `v0.1.0`.

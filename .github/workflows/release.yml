@@ -1,0 +1,70 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libgl1-mesa-dev \
+            libudev-dev \
+            libwayland-dev \
+            libx11-dev \
+            libxkbcommon-dev \
+            pkg-config
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Check
+        run: |
+          cargo fmt --all -- --check
+          cargo test --workspace
+
+      - name: Build release binary
+        run: cargo build --release --package igrf-app
+
+      - name: Prepare release archive
+        id: package
+        shell: bash
+        run: |
+          version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "igrf-app") | .version')"
+          tag="v${version}-main.${GITHUB_RUN_ID}"
+          package="igrf-app-${version}-linux-x86_64.tar.gz"
+
+          mkdir -p dist/package
+          cp target/release/igrf-app SystemConfig.example.json dist/package/
+          tar -C dist/package -czf "dist/${package}" igrf-app SystemConfig.example.json
+          sha256sum "dist/${package}" > "dist/${package}.sha256"
+
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "package=${package}" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ steps.package.outputs.tag }}" \
+            --target "$GITHUB_SHA" \
+            --title "IGRF ${{ steps.package.outputs.tag }}" \
+            --generate-notes \
+            "dist/${{ steps.package.outputs.package }}" \
+            "dist/${{ steps.package.outputs.package }}.sha256"

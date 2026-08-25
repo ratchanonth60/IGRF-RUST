@@ -4,7 +4,7 @@ mod magson;
 mod serial;
 mod setpoint_server;
 
-pub use controller::write_controller_packet;
+pub use controller::{write_controller_packet, ControllerReplyCounter, CONTROLLER_ERROR_REPLY};
 pub use csv_logger::CsvLogger;
 pub use magson::{
     parse_magson_frame, MagsonFrameParser, MagsonSample, MagsonTcpClient, MAGSON_FRAME_SIZE,

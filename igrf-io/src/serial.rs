@@ -95,6 +95,23 @@ impl SerialPortManager {
     }
 
     pub fn read_available(&mut self) -> serialport::Result<Vec<Vec<u8>>> {
+        // Feeding even an empty read matters: the parser defers data that
+        // arrived in the same read as the handshake to the next pass.
+        let bytes = self.read_port()?;
+        Ok(self.parser.feed(&bytes))
+    }
+
+    /// Drains whatever is waiting without the sensor framing.
+    ///
+    /// The controller link speaks a different protocol - it stays silent unless
+    /// it rejects a packet, and then answers `"Error\r"` - so running it
+    /// through [`SensorFrameParser`] would block forever on a handshake that
+    /// never comes.
+    pub fn read_raw(&mut self) -> serialport::Result<Vec<u8>> {
+        self.read_port()
+    }
+
+    fn read_port(&mut self) -> serialport::Result<Vec<u8>> {
         let Some(port) = self.port.as_mut() else {
             return Err(serialport::Error::new(
                 serialport::ErrorKind::NoDevice,
@@ -103,7 +120,7 @@ impl SerialPortManager {
         };
         let available = port.bytes_to_read()? as usize;
         if available == 0 {
-            return Ok(self.parser.feed(&[]));
+            return Ok(Vec::new());
         }
         let mut bytes = [0_u8; 4096];
         let read_len = available.min(bytes.len());
@@ -119,7 +136,7 @@ impl SerialPortManager {
             }
             Err(error) => return Err(serialport::Error::from(error)),
         };
-        Ok(self.parser.feed(&bytes[..count]))
+        Ok(bytes[..count].to_vec())
     }
 
     pub fn parser(&self) -> &SensorFrameParser {

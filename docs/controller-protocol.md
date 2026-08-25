@@ -53,8 +53,13 @@ The CRC is the only integrity check on the link.
 
 A CRC mismatch (`0x0800197c`) or the byte-0 comparison failing (`0x08001972`)
 sends the 5-byte string at `0x20000000`, `"Error\r"`, back to the host and
-restarts the receive loop. The app currently never reads the return path, so
-rejected packets are invisible; reading it would give a live error rate.
+restarts the receive loop.
+
+This is the only thing the controller ever says, so the app counts the replies
+(`ControllerReplyCounter`, `igrf-io/src/controller.rs`) and shows them against
+the packets sent on the controller panel. A rejected packet never reached the
+coils, and the write that produced it looked successful, so without the count a
+noisy line drops setpoints at 10 Hz with nothing on screen to say so.
 
 ## Receive loop
 

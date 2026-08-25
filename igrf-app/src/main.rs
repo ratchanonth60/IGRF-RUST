@@ -12,8 +12,8 @@ use igrf_core::{
     FIRMWARE_MAX_OUTPUT,
 };
 use igrf_io::{
-    write_controller_packet, CsvLogger, MagsonSample, MagsonTcpClient, SerialPortManager,
-    SetpointServer,
+    write_controller_packet, ControllerReplyCounter, CsvLogger, MagsonSample, MagsonTcpClient,
+    SerialPortManager, SetpointServer,
 };
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
@@ -150,6 +150,10 @@ struct IgrfApp {
 
     sensor_manager: SerialPortManager,
     controller_manager: SerialPortManager,
+    controller_replies: ControllerReplyCounter,
+    controller_sent: u64,
+    controller_rejected: u64,
+    controller_reject_reported: bool,
     magson_client: MagsonTcpClient,
     magson_receiver: Option<Receiver<MagsonSample>>,
     sensor_service: SensorService,
@@ -244,6 +248,10 @@ impl IgrfApp {
             lan_task: None,
             sensor_manager: SerialPortManager::default(),
             controller_manager: SerialPortManager::default(),
+            controller_replies: ControllerReplyCounter::default(),
+            controller_sent: 0,
+            controller_rejected: 0,
+            controller_reject_reported: false,
             magson_client: MagsonTcpClient::default(),
             magson_receiver: None,
             sensor_service: SensorService::with_calibration(config.calibration.clone()),
@@ -457,10 +465,13 @@ impl IgrfApp {
             .controller_manager
             .connect(self.controller_port.trim(), baud)
         {
-            Ok(()) => self.set_status(format!(
-                "Controller connected: {} @ {baud}",
-                self.controller_port.trim()
-            )),
+            Ok(()) => {
+                self.reset_controller_link_stats();
+                self.set_status(format!(
+                    "Controller connected: {} @ {baud}",
+                    self.controller_port.trim()
+                ))
+            }
             Err(error) => self.set_error(format!("Controller connect failed: {error}")),
         }
     }
@@ -613,6 +624,8 @@ impl IgrfApp {
                 }
             }
         }
+
+        self.poll_controller_replies();
 
         let samples: Vec<MagsonSample> = self
             .magson_receiver
@@ -941,6 +954,49 @@ impl IgrfApp {
         ) {
             self.set_error(format!("Controller write failed: {error}"));
             self.controller_manager.disconnect();
+        } else {
+            self.controller_sent = self.controller_sent.saturating_add(1);
+        }
+    }
+
+    fn reset_controller_link_stats(&mut self) {
+        self.controller_replies.reset();
+        self.controller_sent = 0;
+        self.controller_rejected = 0;
+        self.controller_reject_reported = false;
+    }
+
+    /// Drains the controller's return path.
+    ///
+    /// The firmware answers only when it throws a packet away, so anything read
+    /// here is a command the coils never acted on. A silent link is a healthy
+    /// one; a growing count means the cable, not the control law, is the
+    /// problem.
+    fn poll_controller_replies(&mut self) {
+        if !self.controller_manager.is_open() {
+            return;
+        }
+        match self.controller_manager.read_raw() {
+            Ok(bytes) => {
+                let rejected = self.controller_replies.feed(&bytes) as u64;
+                if rejected == 0 {
+                    return;
+                }
+                self.controller_rejected = self.controller_rejected.saturating_add(rejected);
+                // Once per connection: at 10 Hz a bad cable would otherwise
+                // overwrite the status line with nothing else.
+                if !self.controller_reject_reported {
+                    self.controller_reject_reported = true;
+                    self.set_error(
+                        "Controller rejected a packet (CRC). Watch the reject count on the \
+                         controller panel.",
+                    );
+                }
+            }
+            Err(error) => {
+                self.set_error(format!("Controller read failed: {error}"));
+                self.controller_manager.disconnect();
+            }
         }
     }
 
@@ -1382,6 +1438,25 @@ impl IgrfApp {
         } else {
             "Controller: disconnected"
         });
+        // Kept visible after a disconnect: a link bad enough to drop packets is
+        // a link bad enough to drop entirely, and the count is the evidence.
+        if self.controller_sent > 0 {
+            let rate = 100.0 * self.controller_rejected as f64 / self.controller_sent as f64;
+            let label = format!(
+                "Rejected: {} / {} sent ({rate:.2}%)",
+                self.controller_rejected, self.controller_sent
+            );
+            if self.controller_rejected == 0 {
+                ui.label(label)
+            } else {
+                ui.colored_label(egui::Color32::from_rgb(220, 120, 60), label)
+            }
+            .on_hover_text(
+                "Packets the firmware answered with \"Error\\r\" because the CRC did not \
+                 match. Those commands never reached the coils. Anything above zero is a \
+                 cabling or baud problem, not a tuning one.",
+            );
+        }
 
         ui.separator();
         ui.label("Magson TCP");

@@ -9,6 +9,11 @@
 //! ```text
 //! echo "39858,-619,20583" | nc -u -w0 127.0.0.1 5005
 //! ```
+//!
+//! The listener binds an address the caller chooses, not `0.0.0.0`. A datagram
+//! on this port drives six 48 V coil drivers and carries no authentication of
+//! any kind, so reaching past the local machine has to be a decision someone
+//! made on purpose - see [`SetpointServer::listen`].
 
 use std::io;
 use std::net::UdpSocket;
@@ -16,6 +21,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
+
+/// Loopback only. An external propagator needs an explicit interface in
+/// `SystemConfig.json`, because widening this is a safety decision.
+pub const DEFAULT_BIND_ADDRESS: &str = "127.0.0.1";
 
 /// Read timeout, so the thread notices `stop` between datagrams.
 const POLL_TIMEOUT: Duration = Duration::from_millis(250);
@@ -45,11 +54,17 @@ pub struct SetpointServer {
 }
 
 impl SetpointServer {
-    /// Binds `0.0.0.0:port` and streams commands down the returned channel.
+    /// Binds `address:port` and streams commands down the returned channel.
     /// `port` 0 asks the OS for a free one; read it back with [`Self::port`].
-    pub fn listen(&mut self, port: u16) -> io::Result<mpsc::Receiver<[f64; 3]>> {
+    ///
+    /// `address` is the interface to accept commands on. Anything other than a
+    /// loopback address exposes the coils to every host that can route to this
+    /// machine, with no authentication and no source check: one `nc -u` from
+    /// anywhere on the lab network is a valid command. Callers pass
+    /// [`DEFAULT_BIND_ADDRESS`] unless someone has decided otherwise.
+    pub fn listen(&mut self, address: &str, port: u16) -> io::Result<mpsc::Receiver<[f64; 3]>> {
         self.disconnect();
-        let socket = UdpSocket::bind(("0.0.0.0", port))?;
+        let socket = UdpSocket::bind((address, port))?;
         socket.set_read_timeout(Some(POLL_TIMEOUT))?;
         self.port = Some(socket.local_addr()?.port());
 
@@ -131,7 +146,7 @@ mod tests {
     #[test]
     fn the_server_delivers_a_command_and_stops_cleanly() {
         let mut server = SetpointServer::default();
-        let receiver = server.listen(0).unwrap();
+        let receiver = server.listen(DEFAULT_BIND_ADDRESS, 0).unwrap();
         let port = server.port().unwrap();
 
         let client = UdpSocket::bind(("127.0.0.1", 0)).unwrap();

@@ -2,7 +2,7 @@ name: Release
 
 on:
   push:
-    branches: [main]
+    branches: [master]
 
 permissions:
   contents: write
@@ -47,7 +47,7 @@ jobs:
         shell: bash
         run: |
           version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "igrf-app") | .version')"
-          tag="v${version}-main.${GITHUB_RUN_ID}"
+          tag="v${version}-master.${GITHUB_RUN_ID}"
           package="igrf-app-${version}-linux-x86_64.tar.gz"
 
           mkdir -p dist/package

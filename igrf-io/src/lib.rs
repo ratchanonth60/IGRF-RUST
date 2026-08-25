@@ -10,4 +10,4 @@ pub use magson::{
     parse_magson_frame, MagsonFrameParser, MagsonSample, MagsonTcpClient, MAGSON_FRAME_SIZE,
 };
 pub use serial::{SensorFrameParser, SerialPortManager, SENSOR_PACKET_SIZE};
-pub use setpoint_server::{parse_setpoint_datagram, SetpointServer};
+pub use setpoint_server::{parse_setpoint_datagram, SetpointServer, DEFAULT_BIND_ADDRESS};

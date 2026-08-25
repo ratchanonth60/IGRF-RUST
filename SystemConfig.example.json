@@ -62,6 +62,7 @@
   },
   "SetpointSlewNtPerSecond": 5000.0,
   "SetpointSourcePort": 5005,
+  "SetpointSourceBindAddress": "127.0.0.1",
   "SetpointProfilePath": "setpoint_profile.csv",
   "Sensor2Ip": "192.168.124.41",
   "Sensor2Port": 1234,

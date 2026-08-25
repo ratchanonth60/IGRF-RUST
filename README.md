@@ -46,6 +46,32 @@ behaviour can be confirmed against a magnetometer rather than trusted from the
 disassembly. Run it with `--dry-run` first; it bypasses the PID and the
 app-side clamp.
 
+## Measuring the coil gain
+
+Nothing in this build knows how many nT of field one output count buys, which
+is why the whole operating point has to be built by the integrator: at
+`Ki = 0.068` an output of -7900 is an integral of about -116000, so every
+watchdog pause is holding the entire standing current in one accumulator.
+
+`--measure-gain` reads the HMR2300 itself and fits it:
+
+```bash
+./tools/probe-controller.py --port /dev/ttyACM0 --sensor-port /dev/ttyUSB0     --axis x --measure-gain
+```
+
+It steps the axis symmetrically to ±50% of the firmware ceiling, averages
+readings at each step, and reports a slope and intercept for all three sensor
+axes. The slope on the driven axis is the gain; the other two are
+cross-coupling, and running all three axes gives the full coil-to-field
+matrix. The intercept is the ambient field, which feedforward needs too - the
+coils have to produce `setpoint - ambient`, not the setpoint.
+
+For a square Helmholtz pair the analytic value is
+`B = 4*mu0*N*I*a^2 / (pi*(a^2+z^2)*sqrt(2a^2+z^2))` per coil at `z = 0.5445a`,
+which for the cage's half-sides works out at 947 / 1131 / 814 nT per
+amp-turn on X / Y / Z. Useful as a sanity check on the measurement, not as a
+substitute for it.
+
 ## Watchdogs
 
 The loop stops driving the coils on any of three faults, and the same gate
@@ -117,10 +143,15 @@ a dead connection does not keep publishing its last sample.
 **The frame decode is not confirmed.** `parse_magson_frame` reads the three
 floats at offsets 48/52/56 of a 72-byte frame, which is what the C# build did,
 but logged values are not physical - three axes near 65000 with variances two
-orders of magnitude apart, and `Mag2X` sawtoothing like a counter. The frame
-specification would settle it. Until then the parser also cannot resynchronise:
-it consumes 72 bytes at a time with no framing, so a single lost byte silently
-ends the stream for the rest of the run. Both wait on the same document.
+orders of magnitude apart, and `Mag2X` sawtoothing like a counter. Only the
+frame specification will settle that.
+
+The stream carries no delimiter, so a lost byte shifts every boundary after
+it. The parser drains a frame per failure while the alignment still looks
+good, and after four consecutive failures starts stepping one byte at a time
+until it locks again. Frames it could not decode are counted and shown on the
+Magson panel as "Undecoded frames": a count that climbs steadily means the
+stream is not being understood, which is otherwise invisible.
 
 ## Setpoint sources
 
@@ -172,12 +203,17 @@ line, then push to `main`.
 - `v0.x.0`: new features or configuration fields
 - `v1.0.0`: stable hardware/protocol contract
 
+`v0.4.1` recovers the Magson stream after a lost byte instead of dropping it
+silently for the rest of the run, reports output limits that are lopsided
+enough to be a typo, and adds `--measure-gain` to `tools/probe-controller.py`.
+
 `v0.4.0` stops the loop when the controller link drops - it previously kept
 integrating against a field it could no longer move - and reopens that port by
-itself the way the sensor port already did. It also feeds the commanded ramp to the Kalman filter as a control input, scales
-its process noise by the real sample interval, and replaces a spike
-threshold that could never fire (300000 nT, above the sensor's own 200000 nT
-full scale) with a configurable `SpikeNt`. Filtered field values during a ramp
+itself the way the sensor port already did. It also feeds the commanded ramp to
+the Kalman filter as a control input, scales its process noise by the real
+sample interval, and replaces a spike threshold that could never fire
+(300000 nT, above the sensor's own 200000 nT full scale) with a configurable
+`SpikeNt`. Filtered field values during a ramp
 differ from `v0.3.0` by up to 11000 nT, because `v0.3.0` was lagging; steady
 state is unchanged.
 
@@ -199,7 +235,7 @@ to move before the merge or two releases claim the same one.
 To tag by hand instead:
 
 ```bash
-git tag -a v0.4.0 -m "Release v0.4.0"
+git tag -a v0.4.1 -m "Release v0.4.1"
 git push origin master --follow-tags
 ```
 

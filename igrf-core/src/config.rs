@@ -19,6 +19,28 @@ pub struct PidSettings {
     pub setpoint: f64,
 }
 
+impl PidSettings {
+    /// How lopsided this axis' drive authority is: the larger output limit over
+    /// the smaller, both as magnitudes.
+    ///
+    /// A Helmholtz pair drives its coil the same way in both directions, so
+    /// 1.0 is the shape the hardware has and anything far from it is a config
+    /// slip rather than a tuning choice. The shipped `PidZ` is 100000 against
+    /// -10000: the loop can push the field seven times harder one way than the
+    /// other, which looks like a nonlinear cage rather than a missing digit.
+    ///
+    /// Returns [`f64::INFINITY`] when one side is zero, which is that axis
+    /// being one-directional.
+    pub fn authority_ratio(&self) -> f64 {
+        let high = self.max_output.abs();
+        let low = self.min_output.abs();
+        match high.min(low) {
+            smaller if smaller > 0.0 => high.max(low) / smaller,
+            _ => f64::INFINITY,
+        }
+    }
+}
+
 fn default_max_output() -> f64 {
     100.0
 }
@@ -527,6 +549,34 @@ mod tests {
         assert_eq!(AppConfig::load(&file), (second, None));
         assert!(!file.with_extension("json.tmp").exists());
         let _ = fs::remove_file(file);
+    }
+
+    #[test]
+    fn authority_ratio_reports_a_lopsided_axis_and_ignores_the_sign() {
+        let even = PidSettings {
+            max_output: 10_000.0,
+            min_output: -10_000.0,
+            ..Default::default()
+        };
+        assert_eq!(even.authority_ratio(), 1.0);
+
+        // The shipped PidZ: the firmware ceiling pulls 100000 to 69000, but the
+        // negative side stays at 10000 either way.
+        let mut lopsided = PidSettings {
+            max_output: 100_000.0,
+            min_output: -10_000.0,
+            ..Default::default()
+        };
+        assert_eq!(lopsided.authority_ratio(), 10.0);
+        lopsided.clamp_to_firmware(2);
+        assert_eq!(lopsided.authority_ratio(), 6.9);
+
+        let one_way = PidSettings {
+            max_output: 10_000.0,
+            min_output: 0.0,
+            ..Default::default()
+        };
+        assert!(one_way.authority_ratio().is_infinite());
     }
 
     #[test]

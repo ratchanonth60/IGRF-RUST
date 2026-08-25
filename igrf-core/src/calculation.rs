@@ -22,16 +22,36 @@ pub enum CalculationError {
 /// Jump between consecutive samples, in nT, that is read as a glitch rather
 /// than a field.
 ///
-/// The previous 300000 could not fire: the HMR2300 spans +-30000 counts, which
-/// at 6.667 nT/count is +-200000 nT, so no pair of readings can differ by more
-/// than 400000 and a full-scale-to-full-scale swing did not reach the bar.
+/// Deliberately larger than any jump the sensor can report, so the rejector is
+/// **off unless someone sets a real number**. The HMR2300 spans +-30000 counts,
+/// which at 6.667 nT/count is +-200000 nT, so no two readings can differ by
+/// more than 400000.
 ///
-/// 5000 nT is ten times the fastest legitimate move - the slew limiter's
-/// default 5000 nT/s is 500 nT per 100 ms tick - and roughly 200 times the
-/// measurement noise the shipped `R` values imply. Raising
-/// `SetpointSlewNtPerSecond` past 10x this needs this raised with it, or the
-/// rejector spends `max_consecutive_rejects` samples fighting each ramp.
-pub const DEFAULT_SPIKE_THRESHOLD_NT: f64 = 5_000.0;
+/// It shipped at 5000 in v0.4.0 and that was wrong. The number was derived from
+/// the slew limiter - ten times its 500 nT per tick - which assumes the field
+/// only moves as fast as the setpoint asks. It does not: the coils can drive it
+/// far faster than the commanded ramp, and on any transient the rejector then
+/// fires on real data, holds a stale value for up to
+/// `max_consecutive_rejects` samples, and hands the PID a measurement that can
+/// sit on the wrong side of zero. The loop drives harder, the field moves
+/// further, the rejector keeps rejecting: a relay oscillator with a period of
+/// about ten samples. On the bench that was a 10000 nT square wave at roughly
+/// 1.4 Hz with an axis pinned to its output limit.
+///
+/// A usable value has to come from how fast the cage can actually slew its
+/// field, which is a measurement nobody has taken yet - `--measure-gain` in
+/// `tools/probe-controller.py` is the start of it. Until then, off.
+pub const DEFAULT_SPIKE_THRESHOLD_NT: f64 = 400_000.0;
+
+/// Consecutive rejects on one axis before the sample stream is treated as
+/// unusable rather than merely glitchy.
+///
+/// Every rejected sample hands the PID the filter's previous state instead of a
+/// measurement. That is fine for an isolated glitch and dangerous in a run: the
+/// held value drifts away from the truth, and the loop keeps integrating
+/// against it. Three is 300 ms at 10 Hz - long enough not to trip on one bad
+/// packet, short enough to stop before an axis saturates.
+pub const REJECTS_BEFORE_FAULT: i32 = 3;
 
 pub struct CalculationService {
     filter_x: KalmanFilter,
@@ -213,6 +233,16 @@ impl CalculationService {
         self.reject_count_z = 0;
     }
 
+    /// Longest run of consecutive rejected samples across the three axes.
+    ///
+    /// Non-zero means the PID is being fed held values rather than
+    /// measurements. See [`REJECTS_BEFORE_FAULT`] for why that has to surface.
+    pub fn consecutive_rejects(&self) -> i32 {
+        self.reject_count_x
+            .max(self.reject_count_y)
+            .max(self.reject_count_z)
+    }
+
     pub fn filter_states(&self) -> [f64; 3] {
         [
             self.filter_x.state(),
@@ -341,17 +371,52 @@ mod tests {
         assert_eq!(service.filter_states()[0], 1000.0);
     }
 
-    /// The default threshold has to be reachable: the old 300000 nT sat above
-    /// the sensor's own full-scale span and could never fire.
+    /// The default must be unreachable. v0.4.0 shipped 5000 nT, which fires on
+    /// a real transient, holds a stale value, and drives the loop into a limit
+    /// cycle. Off until someone measures how fast the cage can slew.
     #[test]
-    fn the_default_spike_threshold_is_inside_the_sensors_range() {
+    fn the_default_spike_threshold_cannot_fire() {
         let full_scale_nt = 30_000.0 * crate::DEFAULT_COUNT_TO_NT;
-        assert!(DEFAULT_SPIKE_THRESHOLD_NT < full_scale_nt);
-        // ...and still well clear of the fastest legitimate move, one tick of
-        // the shipped slew rate.
-        let one_tick_of_slew =
-            crate::AppConfig::default().setpoint_slew_nt_per_second * crate::NOMINAL_TICK_SECONDS;
-        assert!(DEFAULT_SPIKE_THRESHOLD_NT > one_tick_of_slew * 4.0);
+        let largest_possible_jump = 2.0 * full_scale_nt;
+        assert!(
+            DEFAULT_SPIKE_THRESHOLD_NT >= largest_possible_jump,
+            "{DEFAULT_SPIKE_THRESHOLD_NT} can be reached"
+        );
+    }
+
+    /// The rejector hands the PID the filter's last state, so a run of rejects
+    /// is the loop integrating against a number that is no longer a
+    /// measurement. It has to be visible, not silent.
+    #[test]
+    fn a_run_of_rejected_samples_is_reported() {
+        let mut service = CalculationService {
+            spike_threshold_x: 100.0,
+            spike_threshold_y: f64::MAX,
+            spike_threshold_z: f64::MAX,
+            ..Default::default()
+        };
+        let base = RawSensorData {
+            mag_x: 0.0,
+            mag_y: 0.0,
+            mag_z: 0.0,
+        };
+        service.process_sensor_data(&base, [0.0; 3], [0.0; 3], 1.0);
+        assert_eq!(service.consecutive_rejects(), 0);
+
+        let spike = RawSensorData {
+            mag_x: 5_000.0,
+            ..base
+        };
+        for expected in 1..=REJECTS_BEFORE_FAULT {
+            let held = service.process_sensor_data(&spike, [0.0; 3], [0.0; 3], 1.0);
+            assert_eq!(service.consecutive_rejects(), expected);
+            // The held value is what makes this dangerous: it is not the field.
+            close(held.mag_x, 0.0);
+        }
+
+        // A sample back inside the threshold clears the run.
+        service.process_sensor_data(&base, [0.0; 3], [0.0; 3], 1.0);
+        assert_eq!(service.consecutive_rejects(), 0);
     }
 
     /// A ramp is a legitimate move, so the rejector has to score against where

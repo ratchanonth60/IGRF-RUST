@@ -13,7 +13,7 @@ use igrf_core::{
 };
 use igrf_io::{
     write_controller_packet, ControllerReplyCounter, CsvLogger, MagsonSample, MagsonTcpClient,
-    SerialPortManager, SetpointServer,
+    SerialPortManager, SetpointServer, DEFAULT_BIND_ADDRESS,
 };
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
@@ -32,6 +32,18 @@ const PID_INTERVAL: Duration = Duration::from_millis(100);
 const UI_INTERVAL: Duration = Duration::from_millis(50);
 /// A running loop is stopped once the newest sensor packet is older than this.
 const SENSOR_TIMEOUT: Duration = Duration::from_millis(1000);
+/// How long every raw count may sit unchanged before the sensor counts as dead.
+///
+/// The staleness watchdog only sees missing packets. A sensor that keeps
+/// sending the same reading is worse: the loop believes it, the error stays
+/// constant, the integrator winds to its clamp and the coils drive hard while
+/// the real field walks away unmeasured.
+///
+/// Well above SENSOR_TIMEOUT because this is a claim about physics rather than
+/// about the link. One HMR2300 count is 6.667 nT and its noise floor is larger
+/// than that, so all three axes holding identical counts for seconds is a
+/// frozen sensor, not a quiet cage.
+const SENSOR_FROZEN_TIMEOUT: Duration = Duration::from_secs(5);
 /// The C# build reopened the port after this long without a packet, so an
 /// unattended run survives a USB hiccup. The watchdog above only stops the
 /// coils; it never brings the link back.
@@ -171,6 +183,7 @@ struct IgrfApp {
     setpoint_receiver: Option<Receiver<[f64; 3]>>,
     last_setpoint_command: Option<Instant>,
     setpoint_port: String,
+    setpoint_bind_address: String,
     profile: Option<SetpointProfile>,
     profile_path: String,
     profile_started: Option<Instant>,
@@ -193,6 +206,11 @@ struct IgrfApp {
     last_handshake: Option<Instant>,
     last_sensor_packet: Option<Instant>,
     last_sensor_packet_wall: Option<SystemTime>,
+    /// When a raw count last differed from the one before it, with the counts
+    /// that were current then. Raw rather than filtered: the Kalman output
+    /// keeps creeping for a while after its input freezes.
+    last_sensor_change: Option<Instant>,
+    last_sensor_raw: Option<[f64; 3]>,
     sensor_intended: bool,
     last_reconnect: Option<Instant>,
     resume_after_reconnect: bool,
@@ -266,6 +284,7 @@ impl IgrfApp {
             setpoint_server: SetpointServer::default(),
             setpoint_receiver: None,
             last_setpoint_command: None,
+            setpoint_bind_address: config.setpoint_source_bind_address.clone(),
             setpoint_port: if config.setpoint_source_port > 0 {
                 config.setpoint_source_port.to_string()
             } else {
@@ -292,6 +311,8 @@ impl IgrfApp {
             last_handshake: None,
             last_sensor_packet: None,
             last_sensor_packet_wall: None,
+            last_sensor_change: None,
+            last_sensor_raw: None,
             sensor_intended: false,
             last_reconnect: None,
             resume_after_reconnect: false,
@@ -429,6 +450,8 @@ impl IgrfApp {
                 self.last_handshake = None;
                 self.last_sensor_packet = None;
                 self.last_sensor_packet_wall = None;
+                self.last_sensor_change = None;
+                self.last_sensor_raw = None;
                 self.sensor_intended = true;
                 self.set_status(format!(
                     "Sensor connected: {} @ {baud}",
@@ -443,6 +466,8 @@ impl IgrfApp {
         self.sensor_manager.disconnect();
         self.last_sensor_packet = None;
         self.last_sensor_packet_wall = None;
+        self.last_sensor_change = None;
+        self.last_sensor_raw = None;
         self.sensor_intended = false;
         self.resume_pending = false;
         self.paused_by_watchdog = [false; 3];
@@ -650,6 +675,12 @@ impl IgrfApp {
             self.sensor_service.last_raw_y(),
             self.sensor_service.last_raw_z(),
         ];
+        // The first packet starts the clock; after that only a real move
+        // restarts it, so an unchanging sensor ages out.
+        if self.last_sensor_raw != Some(self.raw) {
+            self.last_sensor_raw = Some(self.raw);
+            self.last_sensor_change = Some(Instant::now());
+        }
         self.calibrated = [calibrated.mag_x, calibrated.mag_y, calibrated.mag_z];
         self.processed = self.calculation.process_sensor_data(
             &calibrated,
@@ -709,6 +740,17 @@ impl IgrfApp {
     /// passed and the watchdog would never fire. The wall clock sees that gap;
     /// taking the larger of the two also keeps an NTP step backwards from
     /// hiding a real stall.
+    /// Time since any raw count last moved. `None` before the second packet.
+    fn sensor_change_age(&self) -> Option<Duration> {
+        Some(self.last_sensor_change?.elapsed())
+    }
+
+    /// A sensor still sending, but sending the same numbers for too long.
+    /// Held separate from staleness so the operator is told which one happened.
+    fn sensor_is_frozen(&self) -> bool {
+        sensor_is_frozen(self.sensor_change_age())
+    }
+
     fn sensor_age(&self) -> Option<Duration> {
         let monotonic = self.last_sensor_packet?.elapsed();
         let wall = self
@@ -790,14 +832,24 @@ impl IgrfApp {
                 return;
             }
         };
-        match self.setpoint_server.listen(port) {
+        let address = match self.setpoint_bind_address.trim() {
+            "" => DEFAULT_BIND_ADDRESS.to_owned(),
+            chosen => chosen.to_owned(),
+        };
+        match self.setpoint_server.listen(&address, port) {
             Ok(receiver) => {
                 self.setpoint_receiver = Some(receiver);
                 self.setpoint_source = SetpointSource::Socket;
                 self.last_setpoint_command = Some(Instant::now());
                 self.set_status(format!(
-                    "Setpoint socket listening on UDP {port}: send \"bx,by,bz\" in nT"
+                    "Setpoint socket listening on UDP {address}:{port}: send \"bx,by,bz\" in nT"
                 ));
+                if !is_loopback(&address) {
+                    self.set_error(format!(
+                        "Setpoint socket is reachable from the network on {address}. Datagrams \
+                         are not authenticated: any host that can route here can drive the coils."
+                    ));
+                }
             }
             Err(error) => self.set_error(format!("Setpoint socket failed: {error}")),
         }
@@ -897,10 +949,20 @@ impl IgrfApp {
             self.log_snapshot(elapsed);
             return;
         }
-        if self.pid_running.iter().any(|state| *state) && sensor_is_stale(self.sensor_age()) {
-            let reason = match self.sensor_age() {
-                Some(age) => format!("no sensor data for {:.1}s", age.as_secs_f64()),
-                None => "no sensor data received yet".to_owned(),
+        let frozen = self.sensor_is_frozen();
+        if self.pid_running.iter().any(|state| *state)
+            && (sensor_is_stale(self.sensor_age()) || frozen)
+        {
+            let reason = if frozen {
+                format!(
+                    "sensor readings unchanged for {:.1}s",
+                    self.sensor_change_age().unwrap_or_default().as_secs_f64()
+                )
+            } else {
+                match self.sensor_age() {
+                    Some(age) => format!("no sensor data for {:.1}s", age.as_secs_f64()),
+                    None => "no sensor data received yet".to_owned(),
+                }
             };
             self.paused_by_watchdog = self.pid_running;
             self.watchdog_pause();
@@ -913,7 +975,7 @@ impl IgrfApp {
 
         // Stale data must not resume the loop: the reconnect only proves the
         // port reopened, not that the sensor is talking again.
-        if self.resume_pending && !sensor_is_stale(self.sensor_age()) {
+        if self.resume_pending && !sensor_is_stale(self.sensor_age()) && !frozen {
             self.resume_pending = false;
             self.pid_running = self.paused_by_watchdog;
             self.paused_by_watchdog = [false; 3];
@@ -1143,6 +1205,7 @@ impl IgrfApp {
         self.config.sensor2_port = i32::from(magson_port);
         self.config.calibration = self.calibration.clone();
         self.config.setpoint_profile_path = self.profile_path.clone();
+        self.config.setpoint_source_bind_address = self.setpoint_bind_address.clone();
         self.config.setpoint_source_port = parse_tcp_port(&self.setpoint_port)
             .map(i32::from)
             .unwrap_or(0);
@@ -1197,6 +1260,7 @@ impl IgrfApp {
 
         self.profile_path = config.setpoint_profile_path.clone();
         self.slew_rate = config.setpoint_slew_nt_per_second.to_string();
+        self.setpoint_bind_address = config.setpoint_source_bind_address.clone();
         if config.setpoint_source_port > 0 {
             self.setpoint_port = config.setpoint_source_port.to_string();
         }
@@ -1709,6 +1773,16 @@ impl IgrfApp {
                 ui.horizontal(|ui| {
                     ui.label("UDP port");
                     ui.add(egui::TextEdit::singleline(&mut self.setpoint_port).desired_width(64.0));
+                    ui.label("Bind");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.setpoint_bind_address)
+                            .desired_width(96.0),
+                    )
+                    .on_hover_text(
+                        "Interface the listener accepts datagrams on. 127.0.0.1 keeps it on \
+                         this machine. Anything else lets any host that can route here drive \
+                         the coils, with no authentication.",
+                    );
                     if self.setpoint_server.is_listening() {
                         if ui.button("Stop").clicked() {
                             self.stop_setpoint_server();
@@ -2245,6 +2319,25 @@ fn fits_columns(ui: &egui::Ui, count: usize) -> bool {
 /// An open port that stopped delivering packets leaves the last reading in
 /// place, and the PID would keep integrating against that frozen value until the
 /// output saturates. Never having received a packet counts as stale too.
+/// Whether a bind address keeps the setpoint listener on this machine.
+///
+/// Resolved rather than string-matched: `localhost` is loopback, `0.0.0.0` is
+/// not, and neither is obvious from the text. An address that will not resolve
+/// is reported as exposed, because the warning has to be the safe default.
+fn is_loopback(address: &str) -> bool {
+    use std::net::ToSocketAddrs;
+    (address, 0_u16)
+        .to_socket_addrs()
+        .map(|mut resolved| resolved.all(|socket| socket.ip().is_loopback()))
+        .unwrap_or(false)
+}
+
+/// Unlike [`sensor_is_stale`], `None` is not a fault: it only means no second
+/// packet has arrived yet, which staleness already covers.
+fn sensor_is_frozen(age: Option<Duration>) -> bool {
+    age.is_some_and(|age| age > SENSOR_FROZEN_TIMEOUT)
+}
+
 fn sensor_is_stale(age: Option<Duration>) -> bool {
     age.is_none_or(|age| age > SENSOR_TIMEOUT)
 }
@@ -2426,6 +2519,31 @@ mod tests {
         assert!(sensor_is_stale(Some(
             SENSOR_TIMEOUT + Duration::from_millis(1)
         )));
+    }
+
+    #[test]
+    fn a_sensor_is_frozen_only_after_readings_sit_still_past_the_timeout() {
+        // No second packet yet is staleness's problem, not this one.
+        assert!(!sensor_is_frozen(None));
+        assert!(!sensor_is_frozen(Some(SENSOR_FROZEN_TIMEOUT)));
+        assert!(sensor_is_frozen(Some(
+            SENSOR_FROZEN_TIMEOUT + Duration::from_millis(1)
+        )));
+        assert!(
+            SENSOR_FROZEN_TIMEOUT > SENSOR_TIMEOUT,
+            "a frozen sensor must outlive a missing one, or staleness never reports"
+        );
+    }
+
+    #[test]
+    fn only_addresses_that_resolve_to_this_machine_count_as_loopback() {
+        assert!(is_loopback("127.0.0.1"));
+        assert!(is_loopback("localhost"));
+        // The whole point of the warning: a wildcard bind is not local.
+        assert!(!is_loopback("0.0.0.0"));
+        assert!(!is_loopback("192.168.1.10"));
+        // Unresolvable must warn rather than reassure.
+        assert!(!is_loopback("not a host"));
     }
 
     #[test]

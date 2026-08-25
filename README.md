@@ -118,7 +118,9 @@ line, then push to `main`.
 - `v1.0.0`: stable hardware/protocol contract
 
 `v0.3.0` counts the packets the controller rejects and shows them on the
-controller panel. Nothing about the control path changed.
+controller panel, binds the setpoint listener to loopback unless
+`SetpointSourceBindAddress` says otherwise, and pauses the loop when the sensor
+keeps sending but stops changing.
 
 `v0.2.0` adds the setpoint sources, moves sensor calibration into the config,
 and clamps output to what the controller firmware acts on. Field values from
@@ -126,11 +128,15 @@ its WMM2025 calculation differ from `v0.1.0` by roughly 4 nT, because the
 expansion now uses the model's own 6371.2 km reference radius; logs from the
 two releases are not directly comparable.
 
-Create a release locally after the checks pass:
+Merging to `master` publishes the release: `.github/workflows/release.yml`
+builds the tag from the `igrf-app` version in `Cargo.toml`, so that version has
+to move before the merge or two releases claim the same one.
+
+To tag by hand instead:
 
 ```bash
-git tag -a v0.1.0 -m "Release v0.1.0"
-git push origin main --follow-tags
+git tag -a v0.3.0 -m "Release v0.3.0"
+git push origin master --follow-tags
 ```
 
 `origin` must be configured first if this repository is going to be hosted

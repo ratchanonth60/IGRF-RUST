@@ -183,6 +183,11 @@ pub struct AppConfig {
     pub setpoint_slew_nt_per_second: f64,
     #[serde(rename = "SetpointSourcePort", default)]
     pub setpoint_source_port: i32,
+    /// Interface the setpoint listener binds. Loopback by default: a datagram
+    /// on that port commands the coils and is not authenticated, so accepting
+    /// one from off-machine has to be written down deliberately.
+    #[serde(rename = "SetpointSourceBindAddress", default = "default_bind_address")]
+    pub setpoint_source_bind_address: String,
     #[serde(rename = "SetpointProfilePath", default)]
     pub setpoint_profile_path: String,
     #[serde(rename = "Sensor2Ip", default = "default_sensor2_ip")]
@@ -219,6 +224,10 @@ fn default_setpoint_slew() -> f64 {
     5000.0
 }
 
+fn default_bind_address() -> String {
+    "127.0.0.1".to_owned()
+}
+
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
@@ -231,6 +240,7 @@ impl Default for AppConfig {
             calibration: CalibrationSettings::default(),
             setpoint_slew_nt_per_second: default_setpoint_slew(),
             setpoint_source_port: 0,
+            setpoint_source_bind_address: default_bind_address(),
             setpoint_profile_path: String::new(),
             sensor2_ip: default_sensor2_ip(),
             sensor2_port: default_sensor2_port(),

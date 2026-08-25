@@ -13,6 +13,14 @@ with someone watching the cage.
     ./tools/probe-controller.py --port /dev/ttyACM0 --axis x --dry-run
     ./tools/probe-controller.py --port /dev/ttyACM0 --axis x
 
+There is a second mode, --measure-gain, which reads the HMR2300 itself and
+fits how many nT of field one output count buys. Nothing in the app knows that
+number today, which is why the entire operating point has to be built by the
+integrator instead of commanded directly:
+
+    ./tools/probe-controller.py --port /dev/ttyACM0 --sensor-port /dev/ttyUSB0 \
+        --axis x --measure-gain
+
 Requires pyserial for anything but --dry-run.
 """
 
@@ -26,6 +34,11 @@ CEILING = {"x": 42000.0, "y": 17700.0, "z": 69000.0}
 ARR = {"x": 55960, "y": 58360, "z": 97270}
 BITS = {"x": 16, "y": 16, "z": 32}
 AXIS_INDEX = {"x": 0, "y": 1, "z": 2}
+
+# HMR2300: +-2 G over +-30000 counts.
+COUNT_TO_NT = 20.0 / 3.0
+SENSOR_HANDSHAKE = b"*00WE\r"
+SENSOR_PACKET_SIZE = 7
 
 
 def crc16(data: bytes) -> bytes:
@@ -61,6 +74,136 @@ def predict(axis: str, value: float) -> str:
     duty = min(written / arr, 1.0) * 100
     wrapped = " WRAPPED" if int(value) >= (1 << bits) else " above ARR"
     return f"CCR {written:>6}  duty {duty:5.1f}%  DIR unchanged  <--{wrapped}"
+
+
+def read_sensor(port, samples: int, timeout: float = 5.0) -> tuple[float, float, float]:
+    """Mean of `samples` HMR2300 readings, in nT, as raw scaled counts.
+
+    Hard- and soft-iron terms are deliberately not applied: the gain is a
+    slope, and a constant offset cancels out of one. The soft-iron scale does
+    not, but it is within a percent of unity and the number this produces is a
+    starting point for a bench measurement, not a calibration.
+    """
+    buffer = b""
+    readings = []
+    deadline = time.time() + timeout
+    while len(readings) < samples and time.time() < deadline:
+        buffer += port.read(port.in_waiting or 1)
+        while len(buffer) >= SENSOR_PACKET_SIZE:
+            if buffer[SENSOR_PACKET_SIZE - 1] != 0x0D:
+                buffer = buffer[1:]
+                continue
+            frame = buffer[:SENSOR_PACKET_SIZE]
+            buffer = buffer[SENSOR_PACKET_SIZE:]
+            readings.append(
+                tuple(
+                    int.from_bytes(frame[i : i + 2], "big", signed=True) * COUNT_TO_NT
+                    for i in (0, 2, 4)
+                )
+            )
+    if not readings:
+        raise TimeoutError("no HMR2300 packets; is the sensor port right?")
+    return tuple(sum(axis) / len(readings) for axis in zip(*readings))
+
+
+def fit_line(x: list[float], y: list[float]) -> tuple[float, float]:
+    """Least-squares slope and intercept. Slope is nT per output count."""
+    n = len(x)
+    mean_x = sum(x) / n
+    mean_y = sum(y) / n
+    denominator = sum((value - mean_x) ** 2 for value in x)
+    if denominator == 0:
+        return 0.0, mean_y
+    slope = sum((a - mean_x) * (b - mean_y) for a, b in zip(x, y)) / denominator
+    return slope, mean_y - slope * mean_x
+
+
+def gain_steps(axis: str) -> list[float]:
+    """Commands for the gain fit: symmetric, and well inside the ceiling.
+
+    Nothing here goes near the range check - this measures the linear region,
+    not the boundary the main mode probes. The zero at each end is a baseline,
+    and repeating it catches drift over the run.
+    """
+    ceiling = CEILING[axis]
+    return [ceiling * f for f in (0.0, 0.25, 0.5, -0.25, -0.5, 0.0)]
+
+
+def measure_gain(args) -> int:
+    """Fit nT of field per output count, plus the ambient field.
+
+    The app has no such number, which is why every standing current has to be
+    built by the integrator: at Ki = 0.068 an output of -7900 is an integral of
+    about -116000, so the whole operating point lives in the integrator and any
+    reset drops the field. With a gain the command can be issued directly and
+    the loop left to correct the remainder.
+
+    The intercept is the ambient field at the sensor, which feedforward needs
+    as well: the coils have to produce (setpoint - ambient), not the setpoint.
+    """
+    import serial
+
+    axis = args.axis
+    index = AXIS_INDEX[axis]
+    plan = gain_steps(axis)
+
+    print(f"Axis {axis.upper()}: fitting nT per output count over "
+          f"{min(plan):.0f}..{max(plan):.0f}, ceiling {CEILING[axis]:.0f}.")
+    print("This drives the coils directly, with no PID and no app-side clamp.")
+    if input("Someone watching the cage? [yes/N] ").strip().lower() != "yes":
+        print("Aborted.")
+        return 1
+
+    controller = serial.Serial(args.port, args.baud, timeout=0.5)
+    sensor = serial.Serial(args.sensor_port, args.sensor_baud, timeout=0.5)
+    outputs = [0.0, 0.0, 0.0]
+    commands: list[float] = []
+    fields: list[tuple[float, float, float]] = []
+    try:
+        sensor.write(SENSOR_HANDSHAKE)
+        sensor.flush()
+        time.sleep(0.5)
+        sensor.reset_input_buffer()
+
+        print()
+        print(f"{'command':>10}  {'Bx':>10} {'By':>10} {'Bz':>10}  (nT)")
+        for value in plan:
+            outputs[index] = value
+            controller.write(packet(*outputs))
+            controller.flush()
+            time.sleep(args.dwell)
+            sensor.reset_input_buffer()
+            reading = read_sensor(sensor, args.samples)
+            commands.append(value)
+            fields.append(reading)
+            print(f"{value:>10.0f}  {reading[0]:>10.1f} {reading[1]:>10.1f} "
+                  f"{reading[2]:>10.1f}")
+    finally:
+        # The firmware has no receive timeout and holds its last command
+        # forever, so the coils are left at zero whatever happened above.
+        controller.write(packet(0.0, 0.0, 0.0))
+        controller.flush()
+        time.sleep(0.2)
+        controller.close()
+        sensor.close()
+
+    print()
+    print(f"{'sensor axis':>12}  {'nT / count':>12}  {'ambient nT':>12}  note")
+    for sensor_axis in range(3):
+        slope, intercept = fit_line(commands, [field[sensor_axis] for field in fields])
+        note = "driven axis" if sensor_axis == index else "cross-coupling"
+        print(f"{'XYZ'[sensor_axis]:>12}  {slope:>12.5f}  {intercept:>12.1f}  {note}")
+
+    slope, _ = fit_line(commands, [field[index] for field in fields])
+    if slope != 0:
+        print()
+        print(f"Full scale on this axis: {CEILING[axis] * slope:,.0f} nT at the "
+              f"firmware ceiling of {CEILING[axis]:.0f}.")
+        print(f"To command 50000 nT: {50000 / slope:,.0f} counts.")
+    print()
+    print("Cross-coupling slopes are one column of the coil-to-field matrix.")
+    print("Run all three axes to get the whole thing.")
+    return 0
 
 
 def steps(axis: str) -> list[tuple[float, str]]:
@@ -100,7 +243,31 @@ def main() -> int:
         action="store_true",
         help="print the plan and the predicted behaviour, send nothing",
     )
+    parser.add_argument(
+        "--measure-gain",
+        action="store_true",
+        help="fit nT of field per output count, reading the HMR2300 directly",
+    )
+    parser.add_argument("--sensor-port", help="HMR2300 serial port, for --measure-gain")
+    parser.add_argument("--sensor-baud", type=int, default=9600)
+    parser.add_argument(
+        "--samples",
+        type=int,
+        default=20,
+        help="sensor readings to average per step (default 20)",
+    )
     args = parser.parse_args()
+
+    if args.measure_gain:
+        if not args.port or not args.sensor_port:
+            print("--measure-gain needs both --port and --sensor-port", file=sys.stderr)
+            return 2
+        try:
+            import serial  # noqa: F401
+        except ImportError:
+            print("pyserial is required: pip install pyserial", file=sys.stderr)
+            return 2
+        return measure_gain(args)
 
     axis = args.axis
     index = AXIS_INDEX[axis]

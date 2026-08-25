@@ -16,7 +16,22 @@ pub struct ProcessedData {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CalculationError {
     InvalidMeasurementNoise,
+    InvalidSpikeThreshold,
 }
+
+/// Jump between consecutive samples, in nT, that is read as a glitch rather
+/// than a field.
+///
+/// The previous 300000 could not fire: the HMR2300 spans +-30000 counts, which
+/// at 6.667 nT/count is +-200000 nT, so no pair of readings can differ by more
+/// than 400000 and a full-scale-to-full-scale swing did not reach the bar.
+///
+/// 5000 nT is ten times the fastest legitimate move - the slew limiter's
+/// default 5000 nT/s is 500 nT per 100 ms tick - and roughly 200 times the
+/// measurement noise the shipped `R` values imply. Raising
+/// `SetpointSlewNtPerSecond` past 10x this needs this raised with it, or the
+/// rejector spends `max_consecutive_rejects` samples fighting each ramp.
+pub const DEFAULT_SPIKE_THRESHOLD_NT: f64 = 5_000.0;
 
 pub struct CalculationService {
     filter_x: KalmanFilter,
@@ -46,25 +61,37 @@ impl Default for CalculationService {
             reject_count_x: 0,
             reject_count_y: 0,
             reject_count_z: 0,
-            spike_threshold_x: 300_000.0,
-            spike_threshold_y: 300_000.0,
-            spike_threshold_z: 300_000.0,
+            spike_threshold_x: DEFAULT_SPIKE_THRESHOLD_NT,
+            spike_threshold_y: DEFAULT_SPIKE_THRESHOLD_NT,
+            spike_threshold_z: DEFAULT_SPIKE_THRESHOLD_NT,
             max_consecutive_rejects: 10,
         }
     }
 }
 
 impl CalculationService {
+    /// Filters one sample and scores it against the setpoint.
+    ///
+    /// `command_delta` is how far the commanded field moved since the previous
+    /// sample, per axis. It goes to the Kalman filter as a control input, so a
+    /// ramp is predicted rather than chased: see [`KalmanFilter::filter_ticks`]
+    /// for the 10933 nT that costs on X otherwise. Pass zeroes when the command
+    /// has not moved or is not known.
+    ///
+    /// `ticks` is the real interval since the previous sample in units of
+    /// [`crate::NOMINAL_TICK_SECONDS`].
     pub fn process_sensor_data(
         &mut self,
         raw: &RawSensorData,
-        set_x: f64,
-        set_y: f64,
-        set_z: f64,
+        setpoint: [f64; 3],
+        command_delta: [f64; 3],
+        ticks: f64,
     ) -> ProcessedData {
         let mag_x = filter_axis(
             &mut self.filter_x,
             raw.mag_x,
+            command_delta[0],
+            ticks,
             &mut self.has_sample_x,
             &mut self.reject_count_x,
             self.spike_threshold_x,
@@ -73,6 +100,8 @@ impl CalculationService {
         let mag_y = filter_axis(
             &mut self.filter_y,
             raw.mag_y,
+            command_delta[1],
+            ticks,
             &mut self.has_sample_y,
             &mut self.reject_count_y,
             self.spike_threshold_y,
@@ -81,12 +110,15 @@ impl CalculationService {
         let mag_z = filter_axis(
             &mut self.filter_z,
             raw.mag_z,
+            command_delta[2],
+            ticks,
             &mut self.has_sample_z,
             &mut self.reject_count_z,
             self.spike_threshold_z,
             self.max_consecutive_rejects,
         );
 
+        let [set_x, set_y, set_z] = setpoint;
         let error_x = (set_x - mag_x).abs();
         let error_y = (set_y - mag_y).abs();
         let error_z = (set_z - mag_z).abs();
@@ -118,6 +150,24 @@ impl CalculationService {
         };
         filter.q = q;
         filter.r = r;
+        Ok(())
+    }
+
+    /// Sets one axis' glitch threshold. See [`DEFAULT_SPIKE_THRESHOLD_NT`] for
+    /// what the number has to sit between.
+    pub fn set_spike_threshold(
+        &mut self,
+        axis: usize,
+        spike_nt: f64,
+    ) -> Result<(), CalculationError> {
+        if !spike_nt.is_finite() || spike_nt <= 0.0 {
+            return Err(CalculationError::InvalidSpikeThreshold);
+        }
+        match axis {
+            0 => self.spike_threshold_x = spike_nt,
+            1 => self.spike_threshold_y = spike_nt,
+            _ => self.spike_threshold_z = spike_nt,
+        }
         Ok(())
     }
 
@@ -172,15 +222,22 @@ impl CalculationService {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn filter_axis(
     filter: &mut KalmanFilter,
     raw: f64,
+    command_delta: f64,
+    ticks: f64,
     has_sample: &mut bool,
     reject_count: &mut i32,
     spike_threshold: f64,
     max_consecutive_rejects: i32,
 ) -> f64 {
-    if *has_sample && (raw - filter.state()).abs() > spike_threshold {
+    // Measured against where the command says the field should be, not against
+    // where the filter last was. On a ramp those differ by the whole distance
+    // covered since the last sample, and a threshold tight enough to catch a
+    // real glitch would otherwise reject the ramp itself.
+    if *has_sample && (raw - (filter.state() + command_delta)).abs() > spike_threshold {
         *reject_count += 1;
         if *reject_count < max_consecutive_rejects {
             return filter.state();
@@ -189,7 +246,7 @@ fn filter_axis(
     }
     *reject_count = 0;
     *has_sample = true;
-    filter.filter(raw, 0.0)
+    filter.filter_ticks(raw, command_delta, ticks)
 }
 
 fn calculate_percent(error: f64, setpoint: f64) -> f64 {
@@ -235,9 +292,9 @@ mod tests {
                 mag_y: -50.0,
                 mag_z: 0.0,
             },
-            10.0,
-            -10.0,
-            0.0,
+            [10.0, -10.0, 0.0],
+            [0.0; 3],
+            1.0,
         );
 
         close(data.mag_x, 1.9607843137254901);
@@ -261,7 +318,7 @@ mod tests {
             mag_y: 0.0,
             mag_z: 0.0,
         };
-        service.process_sensor_data(&base, 0.0, 0.0, 0.0);
+        service.process_sensor_data(&base, [0.0; 3], [0.0; 3], 1.0);
 
         let spike = RawSensorData {
             mag_x: 1000.0,
@@ -269,12 +326,76 @@ mod tests {
         };
         for _ in 0..9 {
             assert_eq!(
-                service.process_sensor_data(&spike, 0.0, 0.0, 0.0).mag_x,
+                service
+                    .process_sensor_data(&spike, [0.0; 3], [0.0; 3], 1.0)
+                    .mag_x,
                 0.0
             );
         }
-        assert!(service.process_sensor_data(&spike, 0.0, 0.0, 0.0).mag_x > 0.0);
+        assert!(
+            service
+                .process_sensor_data(&spike, [0.0; 3], [0.0; 3], 1.0)
+                .mag_x
+                > 0.0
+        );
         assert_eq!(service.filter_states()[0], 1000.0);
+    }
+
+    /// The default threshold has to be reachable: the old 300000 nT sat above
+    /// the sensor's own full-scale span and could never fire.
+    #[test]
+    fn the_default_spike_threshold_is_inside_the_sensors_range() {
+        let full_scale_nt = 30_000.0 * crate::DEFAULT_COUNT_TO_NT;
+        assert!(DEFAULT_SPIKE_THRESHOLD_NT < full_scale_nt);
+        // ...and still well clear of the fastest legitimate move, one tick of
+        // the shipped slew rate.
+        let one_tick_of_slew =
+            crate::AppConfig::default().setpoint_slew_nt_per_second * crate::NOMINAL_TICK_SECONDS;
+        assert!(DEFAULT_SPIKE_THRESHOLD_NT > one_tick_of_slew * 4.0);
+    }
+
+    /// A ramp is a legitimate move, so the rejector has to score against where
+    /// the command puts the field, not against the last filtered value.
+    #[test]
+    fn a_commanded_ramp_is_not_mistaken_for_a_spike() {
+        let mut service = CalculationService {
+            spike_threshold_x: 100.0,
+            spike_threshold_y: f64::MAX,
+            spike_threshold_z: f64::MAX,
+            ..Default::default()
+        };
+        let start = RawSensorData {
+            mag_x: 0.0,
+            mag_y: 0.0,
+            mag_z: 0.0,
+        };
+        service.process_sensor_data(&start, [0.0; 3], [0.0; 3], 1.0);
+
+        // 500 nT of commanded move, five times the threshold, tracked exactly.
+        let moved = RawSensorData {
+            mag_x: 500.0,
+            ..start
+        };
+        let data = service.process_sensor_data(&moved, [500.0, 0.0, 0.0], [500.0, 0.0, 0.0], 1.0);
+        close(data.mag_x, 500.0);
+
+        // The same jump with no command behind it is still a spike.
+        let jumped = RawSensorData {
+            mag_x: 1000.0,
+            ..start
+        };
+        let held = service.process_sensor_data(&jumped, [500.0, 0.0, 0.0], [0.0; 3], 1.0);
+        close(held.mag_x, 500.0);
+    }
+
+    #[test]
+    fn set_spike_threshold_rejects_values_that_would_disable_or_invert_it() {
+        let mut service = CalculationService::default();
+        for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert!(service.set_spike_threshold(1, bad).is_err(), "took {bad}");
+        }
+        assert!(service.set_spike_threshold(1, 2500.0).is_ok());
+        assert_eq!(service.spike_threshold_y, 2500.0);
     }
 
     #[test]

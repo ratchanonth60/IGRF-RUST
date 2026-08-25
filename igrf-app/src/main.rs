@@ -9,7 +9,7 @@ use igrf_core::geomagnetism::{
 use igrf_core::{
     field_from_magnitude, AppConfig, CalculationService, CalibrationSettings, FilterSettings,
     PidController, PidSettings, ProcessedData, SensorService, SetpointProfile, SlewLimiter,
-    FIRMWARE_MAX_OUTPUT,
+    FIRMWARE_MAX_OUTPUT, NOMINAL_TICK_SECONDS,
 };
 use igrf_io::{
     write_controller_packet, ControllerReplyCounter, CsvLogger, MagsonSample, MagsonTcpClient,
@@ -211,6 +211,10 @@ struct IgrfApp {
     /// keeps creeping for a while after its input freezes.
     last_sensor_change: Option<Instant>,
     last_sensor_raw: Option<[f64; 3]>,
+    /// Commanded field at the previous sensor packet, so the Kalman filter can
+    /// be told how far the ramp moved instead of having to discover it.
+    /// `None` until the second packet, where the step is unknown, not zero.
+    last_filter_setpoint: Option<[f64; 3]>,
     sensor_intended: bool,
     last_reconnect: Option<Instant>,
     resume_after_reconnect: bool,
@@ -313,6 +317,7 @@ impl IgrfApp {
             last_sensor_packet_wall: None,
             last_sensor_change: None,
             last_sensor_raw: None,
+            last_filter_setpoint: None,
             sensor_intended: false,
             last_reconnect: None,
             resume_after_reconnect: false,
@@ -452,6 +457,7 @@ impl IgrfApp {
                 self.last_sensor_packet_wall = None;
                 self.last_sensor_change = None;
                 self.last_sensor_raw = None;
+                self.last_filter_setpoint = None;
                 self.sensor_intended = true;
                 self.set_status(format!(
                     "Sensor connected: {} @ {baud}",
@@ -468,6 +474,7 @@ impl IgrfApp {
         self.last_sensor_packet_wall = None;
         self.last_sensor_change = None;
         self.last_sensor_raw = None;
+        self.last_filter_setpoint = None;
         self.sensor_intended = false;
         self.resume_pending = false;
         self.paused_by_watchdog = [false; 3];
@@ -583,10 +590,14 @@ impl IgrfApp {
                 .calculation
                 .set_noise(axis, settings.q, settings.r)
                 .is_err()
+                || self
+                    .calculation
+                    .set_spike_threshold(axis, settings.spike_nt)
+                    .is_err()
             {
                 self.filter_settings[axis].sanitize();
                 self.set_error(format!(
-                    "Filter {name}: Q and R must be finite and above zero; restored defaults"
+                    "Filter {name}: Q, R and spike must be finite and above zero; restored defaults"
                 ));
             }
         }
@@ -667,6 +678,12 @@ impl IgrfApp {
     }
 
     fn handle_sensor_packet(&mut self, packet: &[u8]) {
+        // The Kalman filter ticks on sensor packets, not on the PID interval,
+        // so its interval and its control input are both measured here.
+        let ticks = self
+            .last_sensor_packet
+            .map(|previous| previous.elapsed().as_secs_f64() / NOMINAL_TICK_SECONDS)
+            .unwrap_or(1.0);
         self.last_sensor_packet = Some(Instant::now());
         self.last_sensor_packet_wall = Some(SystemTime::now());
         let calibrated = self.sensor_service.process_data(packet);
@@ -682,12 +699,31 @@ impl IgrfApp {
             self.last_sensor_change = Some(Instant::now());
         }
         self.calibrated = [calibrated.mag_x, calibrated.mag_y, calibrated.mag_z];
-        self.processed = self.calculation.process_sensor_data(
-            &calibrated,
-            self.pid_settings[0].setpoint,
-            self.pid_settings[1].setpoint,
-            self.pid_settings[2].setpoint,
-        );
+        // `pid_settings[..].setpoint` is where the slew limiter has ramped to,
+        // so the difference across two packets is exactly how far the field was
+        // asked to move in between - a known input, not something the filter
+        // should have to infer from the measurement.
+        let setpoint: [f64; 3] = std::array::from_fn(|axis| self.pid_settings[axis].setpoint);
+        // Only an axis whose loop is closed and whose packets are reaching the
+        // coils has actually been commanded to move. The setpoint keeps ramping
+        // while the PID is stopped or the controller is unplugged, and
+        // predicting a move that nothing is driving is the same lag with the
+        // sign flipped.
+        let driven = self.controller_manager.is_open();
+        let command_delta = match self.last_filter_setpoint {
+            Some(previous) => std::array::from_fn(|axis| {
+                if driven && self.pid_running[axis] {
+                    setpoint[axis] - previous[axis]
+                } else {
+                    0.0
+                }
+            }),
+            None => [0.0; 3],
+        };
+        self.last_filter_setpoint = Some(setpoint);
+        self.processed =
+            self.calculation
+                .process_sensor_data(&calibrated, setpoint, command_delta, ticks);
         self.filtered = [
             self.processed.mag_x,
             self.processed.mag_y,
@@ -2038,6 +2074,7 @@ impl IgrfApp {
                     for (name, value, speed) in [
                         ("Q process", &mut self.filter_settings[axis].q, 0.05),
                         ("R measure", &mut self.filter_settings[axis].r, 1.0),
+                        ("Spike nT", &mut self.filter_settings[axis].spike_nt, 50.0),
                     ] {
                         ui.label(name);
                         ui.add(egui::DragValue::new(value).speed(speed).range(1e-6..=1e9));

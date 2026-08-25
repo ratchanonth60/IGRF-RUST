@@ -56,6 +56,30 @@ keep working. This build appends four:
 | `CmdX/Y/Z` | The commanded setpoint, before the slew limiter. `SetX/Y/Z` is where the ramp has reached this tick, so the pair tells a slow ramp from a small command. |
 | `TickMs` | The real PID interval for that row. A nominal 100 ms tick lands anywhere from 100 to 133 ms. |
 
+## Kalman filter
+
+`FilterX/Y/Z` in `SystemConfig.json` carry three numbers each:
+
+| Field | Meaning |
+| --- | --- |
+| `Q` | Process noise, nT^2 per 100 ms tick: how far the field is assumed to wander on its own. Scaled by the real interval, so display jitter does not move the gain. |
+| `R` | Measurement noise, nT^2. The shipped 500/200/150 imply 22/14/12 nT rms, against 1.9 nT of pure quantisation. |
+| `SpikeNt` | Jump between samples, in nT, that is read as a glitch instead of a field. |
+
+The filter is told what the setpoint ramp commanded since the last sample, so a
+ramp is predicted rather than discovered. Without that, `Q = 1` against
+`R = 500` is a 2.24 s time constant, and the default 5000 nT/s slew settles
+**10933 nT behind the truth on X** - an error the PID fights and the CSV
+records as real field.
+
+Two consequences worth knowing:
+
+- Raising `SetpointSlewNtPerSecond` far past 50000 needs `SpikeNt` raised with
+  it, or the rejector spends ten samples fighting every ramp.
+- `R` sets the loop's ceiling. Usable bandwidth is about `1/(2*pi*tau)`:
+  0.07 Hz on X, 0.11 Hz on Y, 0.13 Hz on Z. No PID gain gets past that; lower
+  `R` first.
+
 ## Sensor calibration
 
 `Calibration` in `SystemConfig.json` holds the scale, hard-iron offset and
@@ -117,6 +141,13 @@ line, then push to `main`.
 - `v0.x.0`: new features or configuration fields
 - `v1.0.0`: stable hardware/protocol contract
 
+`v0.4.0` feeds the commanded ramp to the Kalman filter as a control input,
+scales its process noise by the real sample interval, and replaces a spike
+threshold that could never fire (300000 nT, above the sensor's own 200000 nT
+full scale) with a configurable `SpikeNt`. Filtered field values during a ramp
+differ from `v0.3.0` by up to 11000 nT, because `v0.3.0` was lagging; steady
+state is unchanged.
+
 `v0.3.0` counts the packets the controller rejects and shows them on the
 controller panel, binds the setpoint listener to loopback unless
 `SetpointSourceBindAddress` says otherwise, and pauses the loop when the sensor
@@ -135,7 +166,7 @@ to move before the merge or two releases claim the same one.
 To tag by hand instead:
 
 ```bash
-git tag -a v0.3.0 -m "Release v0.3.0"
+git tag -a v0.4.0 -m "Release v0.4.0"
 git push origin master --follow-tags
 ```
 

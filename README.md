@@ -117,6 +117,9 @@ line, then push to `main`.
 - `v0.x.0`: new features or configuration fields
 - `v1.0.0`: stable hardware/protocol contract
 
+`v0.3.0` counts the packets the controller rejects and shows them on the
+controller panel. Nothing about the control path changed.
+
 `v0.2.0` adds the setpoint sources, moves sensor calibration into the config,
 and clamps output to what the controller firmware acts on. Field values from
 its WMM2025 calculation differ from `v0.1.0` by roughly 4 nT, because the

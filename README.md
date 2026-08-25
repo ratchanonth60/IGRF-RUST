@@ -80,6 +80,7 @@ decides when it may resume, so a pause and a resume cannot disagree:
 | Fault | Meaning |
 | --- | --- |
 | Controller link down | The serial port closed. Nothing reaches the coils, and the firmware has no receive timeout, so they hold their last command until the port reopens. |
+| Samples rejected | Three readings in a row past `SpikeNt`. Both sensor checks miss this: the packets keep arriving and keep changing. What stops is the loop being handed the filter's last state in place of a measurement. |
 | Sensor frozen | Packets still arrive but the raw counts have not moved for 5 s. One HMR2300 count is 6.667 nT and its noise floor is larger, so three axes sitting exactly still is a dead sensor, not a quiet cage. |
 | Sensor stale | No packet for 5 s. |
 
@@ -107,7 +108,7 @@ keep working. This build appends four:
 | --- | --- |
 | `Q` | Process noise, nT^2 per 100 ms tick: how far the field is assumed to wander on its own. Scaled by the real interval, so display jitter does not move the gain. |
 | `R` | Measurement noise, nT^2. The shipped 500/200/150 imply 22/14/12 nT rms, against 1.9 nT of pure quantisation. |
-| `SpikeNt` | Jump between samples, in nT, that is read as a glitch instead of a field. |
+| `SpikeNt` | Jump between samples, in nT, that is read as a glitch instead of a field. Ships at 400000, above the sensor's own 400000 nT span, so the rejector is **off**. |
 
 The filter is told what the setpoint ramp commanded since the last sample, so a
 ramp is predicted rather than discovered. Without that, `Q = 1` against
@@ -117,11 +118,20 @@ records as real field.
 
 Two consequences worth knowing:
 
-- Raising `SetpointSlewNtPerSecond` far past 50000 needs `SpikeNt` raised with
-  it, or the rejector spends ten samples fighting every ramp.
+- **Do not set `SpikeNt` from the slew rate.** `v0.4.0` shipped 5000 nT on that
+  reasoning and it was wrong: the coils move the field far faster than the
+  commanded ramp, so the rejector fired on real data, held a stale value, and
+  handed the PID a measurement on the wrong side of zero. The loop drove
+  harder, the field moved further, and the whole thing became a relay
+  oscillator - a 10000 nT square wave near 1.4 Hz with an axis pinned to its
+  output limit. A real value has to come from how fast the cage can slew, which
+  nobody has measured; `--measure-gain` is the start of it.
 - `R` sets the loop's ceiling. Usable bandwidth is about `1/(2*pi*tau)`:
   0.07 Hz on X, 0.11 Hz on Y, 0.13 Hz on Z. No PID gain gets past that; lower
   `R` first.
+
+Whatever `SpikeNt` is set to, a run of three rejected samples now stops the
+loop instead of quietly feeding it held values - see Watchdogs.
 
 ## Sensor calibration
 
@@ -203,7 +213,14 @@ line, then push to `main`.
 - `v0.x.0`: new features or configuration fields
 - `v1.0.0`: stable hardware/protocol contract
 
-`v0.4.1` recovers the Magson stream after a lost byte instead of dropping it
+`v0.4.1` **fixes a defect in `v0.4.0` that can drive the cage into
+oscillation.** That release set `SpikeNt` to 5000 nT, which fires on real
+field movement rather than on glitches; the rejector then feeds the PID held
+values and the loop turns into a relay oscillator. `SpikeNt` now ships off, and
+a run of rejects stops the loop rather than hiding. **Anyone running `v0.4.0`
+should raise `SpikeNt` in `SystemConfig.json` or upgrade.**
+
+It also recovers the Magson stream after a lost byte instead of dropping it
 silently for the rest of the run, reports output limits that are lopsided
 enough to be a typo, and adds `--measure-gain` to `tools/probe-controller.py`.
 

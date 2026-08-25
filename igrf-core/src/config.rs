@@ -81,6 +81,88 @@ impl FilterSettings {
     }
 }
 
+/// Sensor calibration for the magnetometer physically mounted in the cage.
+/// Kept in the config rather than the binary: re-fitting the ellipsoid, moving
+/// the sensor or swapping the unit changes these numbers, and nobody should
+/// need a Rust toolchain to apply a new calibration.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CalibrationSettings {
+    /// nT per raw ADC count. HMR2300: +-2 G over +-30000 counts = 20/3.
+    #[serde(rename = "CountToNt", default = "default_count_to_nt")]
+    pub count_to_nt: f64,
+    /// Hard-iron offset in nT, subtracted before the soft-iron matrix.
+    #[serde(rename = "HardIron", default = "default_hard_iron")]
+    pub hard_iron: [f64; 3],
+    /// Soft-iron correction, row-major. An ellipsoid fit produces a symmetric
+    /// matrix; [`Self::asymmetry`] reports how far this one is from that.
+    #[serde(rename = "SoftIron", default = "default_soft_iron")]
+    pub soft_iron: [[f64; 3]; 3],
+}
+
+fn default_count_to_nt() -> f64 {
+    crate::DEFAULT_COUNT_TO_NT
+}
+
+fn default_hard_iron() -> [f64; 3] {
+    [1349.5, 4110.95, -1343.37]
+}
+
+fn default_soft_iron() -> [[f64; 3]; 3] {
+    [
+        [0.9958, -0.0050, 0.0064],
+        [-0.050, 1.0042, -0.0087],
+        [0.0064, -0.0087, 1.0003],
+    ]
+}
+
+impl Default for CalibrationSettings {
+    fn default() -> Self {
+        Self {
+            count_to_nt: default_count_to_nt(),
+            hard_iron: default_hard_iron(),
+            soft_iron: default_soft_iron(),
+        }
+    }
+}
+
+impl CalibrationSettings {
+    /// Largest gap between a soft-iron term and its transpose. An ellipsoid fit
+    /// is symmetric by construction, so anything above roughly 1e-3 is a typo
+    /// in the config: at 50000 nT on one axis a 0.045 asymmetry leaks 2250 nT
+    /// into another, which reads as a cage uniformity problem.
+    pub fn asymmetry(&self) -> f64 {
+        let m = &self.soft_iron;
+        [
+            (m[0][1] - m[1][0]).abs(),
+            (m[0][2] - m[2][0]).abs(),
+            (m[1][2] - m[2][1]).abs(),
+        ]
+        .into_iter()
+        .fold(0.0, f64::max)
+    }
+
+    /// Restores any term that would poison every later sample. A non-finite or
+    /// zero scale silences the sensor; a non-finite matrix turns the whole
+    /// reading into NaN.
+    pub fn sanitize(&mut self) {
+        let defaults = Self::default();
+        if !self.count_to_nt.is_finite() || self.count_to_nt == 0.0 {
+            self.count_to_nt = defaults.count_to_nt;
+        }
+        if !self.hard_iron.iter().all(|value| value.is_finite()) {
+            self.hard_iron = defaults.hard_iron;
+        }
+        if !self
+            .soft_iron
+            .iter()
+            .flatten()
+            .all(|value| value.is_finite())
+        {
+            self.soft_iron = defaults.soft_iron;
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AppConfig {
     #[serde(rename = "PidX", default)]
@@ -95,6 +177,14 @@ pub struct AppConfig {
     pub filter_y: FilterSettings,
     #[serde(rename = "FilterZ", default)]
     pub filter_z: FilterSettings,
+    #[serde(rename = "Calibration", default)]
+    pub calibration: CalibrationSettings,
+    #[serde(rename = "SetpointSlewNtPerSecond", default = "default_setpoint_slew")]
+    pub setpoint_slew_nt_per_second: f64,
+    #[serde(rename = "SetpointSourcePort", default)]
+    pub setpoint_source_port: i32,
+    #[serde(rename = "SetpointProfilePath", default)]
+    pub setpoint_profile_path: String,
     #[serde(rename = "Sensor2Ip", default = "default_sensor2_ip")]
     pub sensor2_ip: String,
     #[serde(rename = "Sensor2Port", default = "default_sensor2_port")]
@@ -121,6 +211,14 @@ fn default_baud() -> u32 {
     9600
 }
 
+/// How fast a commanded setpoint may move, in nT/s. A step from 0 to 50000 nT
+/// typed into the UI would otherwise reach the 48 V / 1500 W drivers as a step
+/// command straight into an inductive load; 5000 nT/s crosses the cage's
+/// full +-0.5 G range in about ten seconds.
+fn default_setpoint_slew() -> f64 {
+    5000.0
+}
+
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
@@ -130,6 +228,10 @@ impl Default for AppConfig {
             filter_x: FilterSettings::default(),
             filter_y: FilterSettings::default(),
             filter_z: FilterSettings::default(),
+            calibration: CalibrationSettings::default(),
+            setpoint_slew_nt_per_second: default_setpoint_slew(),
+            setpoint_source_port: 0,
+            setpoint_profile_path: String::new(),
             sensor2_ip: default_sensor2_ip(),
             sensor2_port: default_sensor2_port(),
             sensor_port: String::new(),
@@ -141,13 +243,32 @@ impl Default for AppConfig {
 }
 
 impl AppConfig {
-    pub fn sanitize(&mut self) {
+    /// Repairs anything unusable and returns which axes had their output
+    /// limits pulled inside the firmware ceiling, as X/Y/Z flags.
+    ///
+    /// The caller surfaces that: a limit silently different from the one in
+    /// the file is exactly the kind of thing that gets tuned around for a week
+    /// before anyone notices.
+    pub fn sanitize(&mut self) -> [bool; 3] {
         self.pid_x.sanitize();
         self.pid_y.sanitize();
         self.pid_z.sanitize();
+        let clamped = [
+            self.pid_x.clamp_to_firmware(0),
+            self.pid_y.clamp_to_firmware(1),
+            self.pid_z.clamp_to_firmware(2),
+        ];
         self.filter_x.sanitize();
         self.filter_y.sanitize();
         self.filter_z.sanitize();
+        self.calibration.sanitize();
+        if !self.setpoint_slew_nt_per_second.is_finite() || self.setpoint_slew_nt_per_second <= 0.0
+        {
+            self.setpoint_slew_nt_per_second = default_setpoint_slew();
+        }
+        if !(0..=u16::MAX as i32).contains(&self.setpoint_source_port) {
+            self.setpoint_source_port = 0;
+        }
         if self.sensor2_ip.trim().is_empty() {
             self.sensor2_ip = default_sensor2_ip();
         }
@@ -160,6 +281,7 @@ impl AppConfig {
         if self.controller_baud == 0 {
             self.controller_baud = default_baud();
         }
+        clamped
     }
 
     /// Writes the config to a sibling temp file and renames it into place, so a
@@ -212,12 +334,46 @@ impl AppConfig {
                 )),
             ),
         };
-        config.sanitize();
+        let clamped = config.sanitize();
+        let problem = problem.or_else(|| {
+            let axes: Vec<&str> = ["X", "Y", "Z"]
+                .into_iter()
+                .zip(clamped)
+                .filter(|(_, was)| *was)
+                .map(|(name, _)| name)
+                .collect();
+            (!axes.is_empty()).then(|| {
+                format!(
+                    "output limits on {} exceed what the controller firmware acts on \
+                     ({:.0}/{:.0}/{:.0}) and were pulled in; past the ceiling the firmware \
+                     writes the raw value into a 16-bit register instead of clamping",
+                    axes.join("/"),
+                    crate::FIRMWARE_MAX_OUTPUT[0],
+                    crate::FIRMWARE_MAX_OUTPUT[1],
+                    crate::FIRMWARE_MAX_OUTPUT[2],
+                )
+            })
+        });
         (config, problem)
     }
 }
 
 impl PidSettings {
+    /// Pulls the output limits inside what the controller firmware can act on.
+    ///
+    /// `axis` is 0/1/2 for X/Y/Z. The firmware does not clamp: past its
+    /// per-axis ceiling it writes the raw value into a capture/compare
+    /// register, which truncates on the 16-bit timers. A configured
+    /// `MaxOutput` above the ceiling therefore does not buy extra authority,
+    /// it buys a command that arrives as something else entirely.
+    pub fn clamp_to_firmware(&mut self, axis: usize) -> bool {
+        let limit = crate::FIRMWARE_MAX_OUTPUT[axis.min(2)];
+        let clamped = self.max_output > limit || self.min_output < -limit;
+        self.max_output = self.max_output.min(limit);
+        self.min_output = self.min_output.max(-limit);
+        clamped
+    }
+
     pub fn sanitize(&mut self) {
         let defaults = Self::default();
         if !self.kp.is_finite() {
@@ -250,6 +406,40 @@ mod tests {
 
     fn path(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("igrf-config-{}-{}.json", std::process::id(), name))
+    }
+
+    /// `SystemConfig.json` on the bench asked for 100000 on Z, above the
+    /// firmware's 69000 ceiling and above TIM2's ARR of 97270 - the axis would
+    /// have sat at 100% duty believing it was at 71%.
+    #[test]
+    fn loading_a_config_pulls_output_limits_inside_the_firmware_ceiling() {
+        let mut config = AppConfig {
+            pid_z: PidSettings {
+                max_output: 100_000.0,
+                min_output: -100_000.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        let clamped = config.sanitize();
+
+        assert_eq!(config.pid_z.max_output, 69_000.0);
+        assert_eq!(config.pid_z.min_output, -69_000.0);
+        assert_eq!(clamped, [false, false, true]);
+    }
+
+    #[test]
+    fn a_limit_already_inside_the_ceiling_is_left_alone() {
+        let mut settings = PidSettings {
+            max_output: 10_000.0,
+            min_output: -10_000.0,
+            ..Default::default()
+        };
+
+        assert!(!settings.clamp_to_firmware(1));
+        assert_eq!(settings.max_output, 10_000.0);
+        assert_eq!(settings.min_output, -10_000.0);
     }
 
     #[test]

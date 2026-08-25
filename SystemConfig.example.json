@@ -35,8 +35,36 @@
     "Q": 1.0,
     "R": 150.0
   },
+  "Calibration": {
+    "CountToNt": 6.666666666666667,
+    "HardIron": [
+      1349.5,
+      4110.95,
+      -1343.37
+    ],
+    "SoftIron": [
+      [
+        0.9958,
+        -0.005,
+        0.0064
+      ],
+      [
+        -0.05,
+        1.0042,
+        -0.0087
+      ],
+      [
+        0.0064,
+        -0.0087,
+        1.0003
+      ]
+    ]
+  },
+  "SetpointSlewNtPerSecond": 5000.0,
+  "SetpointSourcePort": 5005,
+  "SetpointProfilePath": "setpoint_profile.csv",
   "Sensor2Ip": "192.168.124.41",
-  "Sensor2Port": 12345,
+  "Sensor2Port": 1234,
   "SensorPort": "/dev/ttyUSB0",
   "SensorBaud": 9600,
   "ControllerPort": "/dev/ttyACM0",

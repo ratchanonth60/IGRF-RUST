@@ -7,11 +7,13 @@ use igrf_core::geomagnetism::{
     Coordinate, GeomagnetismCalculator, GeomagnetismResult, UtcDateTime,
 };
 use igrf_core::{
-    AppConfig, CalculationService, FilterSettings, PidController, PidSettings, ProcessedData,
-    SensorService,
+    field_from_magnitude, AppConfig, CalculationService, CalibrationSettings, FilterSettings,
+    PidController, PidSettings, ProcessedData, SensorService, SetpointProfile, SlewLimiter,
+    FIRMWARE_MAX_OUTPUT,
 };
 use igrf_io::{
     write_controller_packet, CsvLogger, MagsonSample, MagsonTcpClient, SerialPortManager,
+    SetpointServer,
 };
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
@@ -20,7 +22,10 @@ use std::time::{Duration, Instant, SystemTime};
 const CONFIG_PATH: &str = "SystemConfig.json";
 /// Column-for-column the header the C# build wrote, so existing analysis
 /// scripts keep working against logs from either implementation.
-const LOG_HEADER: &str = "Timestamp,MagX,MagY,MagZ,MagTotal,SetX,SetY,SetZ,SetTotal,ErrX,ErrY,ErrZ,OutX,OutY,OutZ,KpX,KiX,KdX,KpY,KiY,KdY,KpZ,KiZ,KdZ,Mag2X,Mag2Y,Mag2Z,Mag2Total";
+/// The C# columns, in the C# order, plus the four this build adds at the end:
+/// the commanded setpoint before the slew limiter and the real tick interval.
+/// Appending keeps every existing analysis script working.
+const LOG_HEADER: &str = "Timestamp,MagX,MagY,MagZ,MagTotal,SetX,SetY,SetZ,SetTotal,ErrX,ErrY,ErrZ,OutX,OutY,OutZ,KpX,KiX,KdX,KpY,KiY,KdY,KpZ,KiZ,KdZ,Mag2X,Mag2Y,Mag2Z,Mag2Total,CmdX,CmdY,CmdZ,TickMs";
 const HANDSHAKE: [u8; 6] = [0x2A, 0x30, 0x30, 0x57, 0x45, 0x0D];
 const HISTORY_LIMIT: usize = 500;
 const PID_INTERVAL: Duration = Duration::from_millis(100);
@@ -34,6 +39,13 @@ const SENSOR_RECONNECT_AFTER: Duration = Duration::from_secs(15);
 /// How often a reconnect is retried while the sensor stays silent.
 const RECONNECT_INTERVAL: Duration = Duration::from_secs(10);
 const AXES: [char; 3] = ['X', 'Y', 'Z'];
+/// A commanded field with no fresh command for this long ramps back to zero.
+/// An external propagator that dies would otherwise leave the coils holding
+/// its last vector for as long as the app runs.
+const SETPOINT_SOURCE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Soft-iron terms above this far from their transpose are a config typo, not a
+/// calibration: an ellipsoid fit is symmetric by construction.
+const SOFT_IRON_ASYMMETRY_LIMIT: f64 = 1e-3;
 const STOP_RED: Color32 = Color32::from_rgb(170, 45, 45);
 /// Below this the side-by-side X/Y/Z layout stacks vertically instead.
 const MIN_COLUMN_WIDTH: f32 = 190.0;
@@ -74,29 +86,13 @@ impl History {
     }
 }
 
+#[derive(Default)]
 struct PlotHistory {
     sensor_setpoint: [History; 3],
     sensor_measured: [History; 3],
     sensor_magnitude_setpoint: History,
     sensor_magnitude_measured: History,
     magson: [History; 4],
-}
-
-impl Default for PlotHistory {
-    fn default() -> Self {
-        Self {
-            sensor_setpoint: [History::default(), History::default(), History::default()],
-            sensor_measured: [History::default(), History::default(), History::default()],
-            sensor_magnitude_setpoint: History::default(),
-            sensor_magnitude_measured: History::default(),
-            magson: [
-                History::default(),
-                History::default(),
-                History::default(),
-                History::default(),
-            ],
-        }
-    }
 }
 
 impl PlotHistory {
@@ -111,6 +107,28 @@ impl PlotHistory {
         self.sensor_magnitude_measured.clear();
         for history in &mut self.magson {
             history.clear();
+        }
+    }
+}
+
+/// Where the commanded field comes from. Only one is live at a time, so a
+/// profile cannot fight a socket for the coils.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SetpointSource {
+    /// Typed into the UI.
+    Manual,
+    /// Replayed from a CSV of `time_s,bx_nt,by_nt,bz_nt`.
+    Profile,
+    /// Pushed over UDP by an external propagator.
+    Socket,
+}
+
+impl SetpointSource {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Manual => "Manual",
+            Self::Profile => "CSV profile",
+            Self::Socket => "UDP socket",
         }
     }
 }
@@ -138,8 +156,23 @@ struct IgrfApp {
     calculation: CalculationService,
     pid_settings: [PidSettings; 3],
     filter_settings: [FilterSettings; 3],
+    calibration: CalibrationSettings,
     pids: [PidController; 3],
     pid_running: [bool; 3],
+
+    /// Rate limit between a commanded field and what the PID actually chases.
+    slew: SlewLimiter,
+    setpoint_source: SetpointSource,
+    setpoint_server: SetpointServer,
+    setpoint_receiver: Option<Receiver<[f64; 3]>>,
+    last_setpoint_command: Option<Instant>,
+    setpoint_port: String,
+    profile: Option<SetpointProfile>,
+    profile_path: String,
+    profile_started: Option<Instant>,
+    slew_rate: String,
+    manual_magnitude: String,
+    manual_setpoint_error: Option<String>,
 
     raw: [f64; 3],
     calibrated: [f64; 3],
@@ -190,6 +223,7 @@ impl IgrfApp {
             config.filter_z.clone(),
         ];
         let pids = pid_settings.clone().map(pid_from_settings);
+        let initial_setpoint = std::array::from_fn(|axis| pid_settings[axis].setpoint);
         let (available_ports, status) = match serialport::available_ports() {
             Ok(ports) => (stable_first(ports), "Ready".to_owned()),
             Err(error) => (Vec::new(), format!("Port scan unavailable: {error}")),
@@ -212,12 +246,29 @@ impl IgrfApp {
             controller_manager: SerialPortManager::default(),
             magson_client: MagsonTcpClient::default(),
             magson_receiver: None,
-            sensor_service: SensorService::default(),
+            sensor_service: SensorService::with_calibration(config.calibration.clone()),
             calculation: CalculationService::default(),
             pid_settings,
             filter_settings,
+            calibration: config.calibration.clone(),
             pids,
             pid_running: [false; 3],
+            slew: SlewLimiter::new(config.setpoint_slew_nt_per_second, initial_setpoint),
+            setpoint_source: SetpointSource::Manual,
+            setpoint_server: SetpointServer::default(),
+            setpoint_receiver: None,
+            last_setpoint_command: None,
+            setpoint_port: if config.setpoint_source_port > 0 {
+                config.setpoint_source_port.to_string()
+            } else {
+                "5005".to_owned()
+            },
+            profile: None,
+            profile_path: config.setpoint_profile_path.clone(),
+            profile_started: None,
+            slew_rate: config.setpoint_slew_nt_per_second.to_string(),
+            manual_magnitude: "0".to_owned(),
+            manual_setpoint_error: None,
             raw: [0.0; 3],
             calibrated: [0.0; 3],
             filtered: [0.0; 3],
@@ -415,8 +466,28 @@ impl IgrfApp {
     }
 
     fn disconnect_controller(&mut self) {
+        // Stop driving before the port closes: the controller holds the last
+        // output it was given, so a bare disconnect leaves the coils energised
+        // and the integrators winding for the next connect.
+        self.stop_all();
         self.controller_manager.disconnect();
         self.set_status("Controller disconnected");
+    }
+
+    /// Best-effort zero on the coils, shared by every path that stops driving
+    /// them. The controller keeps the last packet it received, so anything that
+    /// stops the loop has to send zeros first; a failed write means the link is
+    /// gone anyway, so the port is closed.
+    fn zero_outputs(&mut self) -> std::io::Result<()> {
+        self.outputs = [0.0; 3];
+        if !self.controller_manager.is_open() {
+            return Ok(());
+        }
+        let result = write_controller_packet(&mut self.controller_manager, 0.0, 0.0, 0.0);
+        if result.is_err() {
+            self.controller_manager.disconnect();
+        }
+        result
     }
 
     fn connect_magson(&mut self) {
@@ -449,8 +520,28 @@ impl IgrfApp {
         self.set_status("Magson disconnected");
     }
 
+    /// Flags a soft-iron matrix that is not symmetric. An ellipsoid fit always
+    /// produces one, so an outlier is a mistyped digit rather than a real
+    /// calibration - and the error only shows up once the cage is driving a
+    /// field, as cross-axis leak that reads like poor uniformity.
+    fn calibration_warning(&self) -> Option<String> {
+        let asymmetry = self.calibration.asymmetry();
+        (asymmetry > SOFT_IRON_ASYMMETRY_LIMIT).then(|| {
+            format!(
+                "soft-iron is asymmetric by {asymmetry:.4}; at 50000 nT on one axis that leaks \
+                 {:.0} nT into another. Check the SoftIron matrix in {CONFIG_PATH}.",
+                asymmetry * 50_000.0
+            )
+        })
+    }
+
+    fn apply_calibration(&mut self) {
+        self.calibration.sanitize();
+        self.sensor_service.calibration = self.calibration.clone();
+    }
+
     fn apply_filter_settings(&mut self) {
-        for axis in 0..3 {
+        for (axis, name) in AXES.into_iter().enumerate() {
             let settings = self.filter_settings[axis].clone();
             if self
                 .calculation
@@ -459,8 +550,7 @@ impl IgrfApp {
             {
                 self.filter_settings[axis].sanitize();
                 self.set_error(format!(
-                    "Filter {}: Q and R must be finite and above zero; restored defaults",
-                    AXES[axis]
+                    "Filter {name}: Q and R must be finite and above zero; restored defaults"
                 ));
             }
         }
@@ -496,6 +586,7 @@ impl IgrfApp {
     fn poll_io(&mut self) {
         self.poll_lan_task();
         self.apply_filter_settings();
+        self.apply_calibration();
         self.maybe_reconnect_sensor();
         if self.sensor_manager.is_open() {
             let now = Instant::now();
@@ -614,12 +705,165 @@ impl IgrfApp {
         Some(monotonic.max(wall))
     }
 
+    /// Commands a field vector through the slew limiter. Nothing in the app
+    /// writes `pid_settings[..].setpoint` directly any more: every command,
+    /// whatever its source, ramps.
+    fn command_setpoint(&mut self, field_nt: [f64; 3]) {
+        self.slew.command(field_nt);
+    }
+
+    /// Advances the ramp and publishes the result as the live setpoint.
+    fn advance_setpoint(&mut self, dt: f64) {
+        self.slew.rate_nt_per_second = self.config.setpoint_slew_nt_per_second;
+        let current = self.slew.step(dt);
+        for (settings, value) in self.pid_settings.iter_mut().zip(current) {
+            settings.setpoint = value;
+        }
+    }
+
+    /// Pulls the newest command from whichever source is live. Only the last
+    /// datagram of a burst matters: a setpoint is state, not a queue to drain.
+    fn poll_setpoint_source(&mut self) {
+        match self.setpoint_source {
+            SetpointSource::Manual => {}
+            SetpointSource::Profile => {
+                let Some(started) = self.profile_started else {
+                    return;
+                };
+                let Some(profile) = &self.profile else {
+                    return;
+                };
+                let time = started.elapsed().as_secs_f64();
+                if let Some(field) = profile.sample(time) {
+                    self.slew.command(field);
+                }
+                if time > profile.duration_s() {
+                    self.profile_started = None;
+                    self.set_status("Setpoint profile finished; holding the last row");
+                }
+            }
+            SetpointSource::Socket => {
+                let Some(receiver) = &self.setpoint_receiver else {
+                    return;
+                };
+                if let Some(field) = receiver.try_iter().last() {
+                    self.slew.command(field);
+                    self.last_setpoint_command = Some(Instant::now());
+                    return;
+                }
+                // A propagator that dies mid-run leaves the cage holding its
+                // last command indefinitely. The sensor has a watchdog; the
+                // commanded field needs one too.
+                if self
+                    .last_setpoint_command
+                    .is_some_and(|at| at.elapsed() > SETPOINT_SOURCE_TIMEOUT)
+                {
+                    self.last_setpoint_command = None;
+                    self.slew.command([0.0; 3]);
+                    self.set_error(format!(
+                        "No setpoint datagram for {}s; ramping the field to zero",
+                        SETPOINT_SOURCE_TIMEOUT.as_secs()
+                    ));
+                }
+            }
+        }
+    }
+
+    fn start_setpoint_server(&mut self) {
+        let port = match parse_tcp_port(&self.setpoint_port) {
+            Ok(value) => value,
+            Err(error) => {
+                self.set_error(format!("Setpoint port: {error}"));
+                return;
+            }
+        };
+        match self.setpoint_server.listen(port) {
+            Ok(receiver) => {
+                self.setpoint_receiver = Some(receiver);
+                self.setpoint_source = SetpointSource::Socket;
+                self.last_setpoint_command = Some(Instant::now());
+                self.set_status(format!(
+                    "Setpoint socket listening on UDP {port}: send \"bx,by,bz\" in nT"
+                ));
+            }
+            Err(error) => self.set_error(format!("Setpoint socket failed: {error}")),
+        }
+    }
+
+    fn stop_setpoint_server(&mut self) {
+        self.setpoint_server.disconnect();
+        self.setpoint_receiver = None;
+        if self.setpoint_source == SetpointSource::Socket {
+            self.setpoint_source = SetpointSource::Manual;
+        }
+        self.set_status("Setpoint socket stopped; holding the last command");
+    }
+
+    fn load_setpoint_profile(&mut self) {
+        if self.profile_path.trim().is_empty() {
+            self.set_error("Setpoint profile path is empty");
+            return;
+        }
+        match SetpointProfile::load(self.profile_path.trim()) {
+            Ok(Ok(profile)) => {
+                let rows = profile.len();
+                let duration = profile.duration_s();
+                self.profile = Some(profile);
+                self.profile_started = None;
+                self.setpoint_source = SetpointSource::Profile;
+                self.set_status(format!(
+                    "Loaded {rows} profile rows spanning {duration:.1}s; press Play to run"
+                ));
+            }
+            Ok(Err(problem)) => self.set_error(format!("Setpoint profile: {problem}")),
+            Err(error) => self.set_error(format!("Cannot read setpoint profile: {error}")),
+        }
+    }
+
+    /// Applies a magnitude plus the declination/inclination the WMM panel
+    /// reports, so a run can be commanded as "the local field at 1.2x" instead
+    /// of three hand-computed components.
+    fn apply_manual_magnitude(&mut self) {
+        let result = (|| {
+            let magnitude = parse_f64(&self.manual_magnitude, "magnitude")?;
+            let wmm = self
+                .manual_result
+                .ok_or_else(|| "run the WMM2025 calculation first".to_owned())?;
+            Ok::<_, String>(field_from_magnitude(
+                magnitude,
+                wmm.declination,
+                wmm.inclination,
+            ))
+        })();
+        match result {
+            Ok(field) => {
+                self.setpoint_source = SetpointSource::Manual;
+                self.manual_setpoint_error = None;
+                self.command_setpoint(field);
+                self.set_status(format!(
+                    "Commanded |B| {:.1} nT along the WMM direction; ramping at {:.0} nT/s",
+                    self.manual_magnitude.trim().parse::<f64>().unwrap_or(0.0),
+                    self.config.setpoint_slew_nt_per_second
+                ));
+            }
+            Err(problem) => self.manual_setpoint_error = Some(problem),
+        }
+    }
+
     fn run_pid(&mut self) {
         let now = Instant::now();
-        if now.duration_since(self.last_pid_tick) < PID_INTERVAL {
+        let elapsed = now.duration_since(self.last_pid_tick);
+        if elapsed < PID_INTERVAL {
             return;
         }
         self.last_pid_tick = now;
+        // The repaint that drives this loop is quantised to the display's
+        // refresh, so a nominal 100 ms tick lands anywhere from 100 to 133 ms.
+        // Feeding the real interval to the PID keeps Ki and Kd meaning what
+        // they meant when they were tuned.
+        let dt = elapsed.as_secs_f64();
+        self.poll_setpoint_source();
+        self.advance_setpoint(dt);
         if let Some((axis, error)) =
             self.pid_settings
                 .iter()
@@ -631,12 +875,13 @@ impl IgrfApp {
                 })
         {
             self.pid_running = [false; 3];
-            self.outputs = [0.0; 3];
+            let _ = self.zero_outputs();
             self.pid_settings[axis].sanitize();
             self.set_error(format!(
                 "PID {}: {error}; restored safe defaults",
                 AXES[axis]
             ));
+            self.log_snapshot(elapsed);
             return;
         }
         if self.pid_running.iter().any(|state| *state) && sensor_is_stale(self.sensor_age()) {
@@ -645,12 +890,17 @@ impl IgrfApp {
                 None => "no sensor data received yet".to_owned(),
             };
             self.paused_by_watchdog = self.pid_running;
-            self.stop_all();
-            self.set_error(format!("PID stopped: {reason}"));
+            self.watchdog_pause();
+            self.set_error(format!("PID paused: {reason}"));
+            // The rows around a fault are the ones worth having; the early
+            // return would drop exactly those from the CSV.
+            self.log_snapshot(elapsed);
             return;
         }
 
-        if self.resume_pending {
+        // Stale data must not resume the loop: the reconnect only proves the
+        // port reopened, not that the sensor is talking again.
+        if self.resume_pending && !sensor_is_stale(self.sensor_age()) {
             self.resume_pending = false;
             self.pid_running = self.paused_by_watchdog;
             self.paused_by_watchdog = [false; 3];
@@ -662,51 +912,65 @@ impl IgrfApp {
         for axis in 0..3 {
             apply_pid_settings(&mut self.pids[axis], &self.pid_settings[axis]);
             self.outputs[axis] = if self.pid_running[axis] {
-                self.pids[axis].calculate(self.pid_settings[axis].setpoint, self.filtered[axis])
+                self.pids[axis].calculate_dt(
+                    self.pid_settings[axis].setpoint,
+                    self.filtered[axis],
+                    dt,
+                )
             } else {
                 0.0
             };
         }
 
-        if self.controller_manager.is_open() {
-            if let Err(error) = write_controller_packet(
-                &mut self.controller_manager,
-                self.outputs[0],
-                self.outputs[1],
-                self.outputs[2],
-            ) {
-                self.set_error(format!("Controller write failed: {error}"));
-                self.controller_manager.disconnect();
-            }
-        }
-        self.log_snapshot();
+        self.write_outputs();
+        self.log_snapshot(elapsed);
     }
 
-    fn log_snapshot(&mut self) {
-        if self.logger.is_none() {
+    /// Sends the current outputs to the controller. A failed write closes the
+    /// port: the link is gone, and pretending otherwise would leave the coils
+    /// holding the last packet with nothing watching them.
+    fn write_outputs(&mut self) {
+        if !self.controller_manager.is_open() {
             return;
         }
-        // Matches the C# row exactly: filtered field as Mag*, the unsigned error
-        // from ProcessedData, F2 everywhere except the F3 gains.
-        let timestamp = chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
+        if let Err(error) = write_controller_packet(
+            &mut self.controller_manager,
+            self.outputs[0],
+            self.outputs[1],
+            self.outputs[2],
+        ) {
+            self.set_error(format!("Controller write failed: {error}"));
+            self.controller_manager.disconnect();
+        }
+    }
+
+    /// Formats one CSV row. Free-standing so a test can check it against
+    /// [`LOG_HEADER`] without a running app.
+    ///
+    /// The first 28 columns match the C# row exactly: the filtered field as
+    /// `Mag*`, the unsigned error from `ProcessedData`, F2 everywhere except
+    /// the F3 gains. `Cmd*` and `TickMs` are appended by this build.
+    #[allow(clippy::too_many_arguments)]
+    fn snapshot_row(
+        timestamp: &str,
+        filtered: [f64; 3],
+        setpoints: [f64; 3],
+        errors: [f64; 3],
+        gains: &[PidSettings; 3],
+        outputs: [f64; 3],
+        magson: [f64; 3],
+        commanded: [f64; 3],
+        tick: Duration,
+    ) -> String {
         let magnitude =
             |values: [f64; 3]| values.iter().map(|value| value * value).sum::<f64>().sqrt();
-        let setpoints = [
-            self.pid_settings[0].setpoint,
-            self.pid_settings[1].setpoint,
-            self.pid_settings[2].setpoint,
-        ];
-        let errors = [
-            self.processed.error_x,
-            self.processed.error_y,
-            self.processed.error_z,
-        ];
-        let line = format!(
-            "{timestamp},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{:.2},{:.2},{:.2}",
-            self.filtered[0],
-            self.filtered[1],
-            self.filtered[2],
-            magnitude(self.filtered),
+        format!(
+            "{},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.3},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.1}",
+            timestamp,
+            filtered[0],
+            filtered[1],
+            filtered[2],
+            magnitude(filtered),
             setpoints[0],
             setpoints[1],
             setpoints[2],
@@ -714,22 +978,52 @@ impl IgrfApp {
             errors[0],
             errors[1],
             errors[2],
-            self.outputs[0],
-            self.outputs[1],
-            self.outputs[2],
-            self.pid_settings[0].kp,
-            self.pid_settings[0].ki,
-            self.pid_settings[0].kd,
-            self.pid_settings[1].kp,
-            self.pid_settings[1].ki,
-            self.pid_settings[1].kd,
-            self.pid_settings[2].kp,
-            self.pid_settings[2].ki,
-            self.pid_settings[2].kd,
-            self.magson[0],
-            self.magson[1],
-            self.magson[2],
-            self.magson_total,
+            outputs[0],
+            outputs[1],
+            outputs[2],
+            gains[0].kp,
+            gains[0].ki,
+            gains[0].kd,
+            gains[1].kp,
+            gains[1].ki,
+            gains[1].kd,
+            gains[2].kp,
+            gains[2].ki,
+            gains[2].kd,
+            magson[0],
+            magson[1],
+            magson[2],
+            magnitude(magson),
+            commanded[0],
+            commanded[1],
+            commanded[2],
+            tick.as_secs_f64() * 1000.0,
+        )
+    }
+
+    fn log_snapshot(&mut self, tick: Duration) {
+        if self.logger.is_none() {
+            return;
+        }
+        let line = Self::snapshot_row(
+            &chrono::Local::now()
+                .format("%Y-%m-%d %H:%M:%S%.3f")
+                .to_string(),
+            self.filtered,
+            std::array::from_fn(|axis| self.pid_settings[axis].setpoint),
+            [
+                self.processed.error_x,
+                self.processed.error_y,
+                self.processed.error_z,
+            ],
+            &self.pid_settings,
+            self.outputs,
+            self.magson,
+            // Where the ramp is headed, as opposed to the setpoints, which are
+            // where it has reached this tick. Without both, a log cannot tell a
+            // slow ramp from a small command.
+            self.slew.target(),
+            tick,
         );
         let result = self.logger.as_mut().map(|logger| logger.write_line(&line));
         if let Some(Err(error)) = result {
@@ -791,8 +1085,33 @@ impl IgrfApp {
         self.config.controller_baud = controller_baud;
         self.config.sensor2_ip = self.magson_ip.clone();
         self.config.sensor2_port = i32::from(magson_port);
-        self.config.sanitize();
+        self.config.calibration = self.calibration.clone();
+        self.config.setpoint_profile_path = self.profile_path.clone();
+        self.config.setpoint_source_port = parse_tcp_port(&self.setpoint_port)
+            .map(i32::from)
+            .unwrap_or(0);
+        let clamped = self.config.sanitize();
+        // Saving writes back whatever sanitize settled on, so the panel has to
+        // follow or the UI would keep showing a limit the file no longer holds.
+        self.pid_settings = [
+            self.config.pid_x.clone(),
+            self.config.pid_y.clone(),
+            self.config.pid_z.clone(),
+        ];
         match self.config.save(CONFIG_PATH) {
+            Ok(()) if clamped.iter().any(|was| *was) => self.set_error(format!(
+                "Saved {CONFIG_PATH}, but output limits on {} were pulled inside the \
+                 firmware ceiling ({:.0}/{:.0}/{:.0})",
+                AXES.into_iter()
+                    .zip(clamped)
+                    .filter(|(_, was)| *was)
+                    .map(|(name, _)| name.to_string())
+                    .collect::<Vec<_>>()
+                    .join("/"),
+                FIRMWARE_MAX_OUTPUT[0],
+                FIRMWARE_MAX_OUTPUT[1],
+                FIRMWARE_MAX_OUTPUT[2],
+            )),
             Ok(()) => self.set_status(format!("Saved {CONFIG_PATH}")),
             Err(error) => self.set_error(format!("Cannot save {CONFIG_PATH}: {error}")),
         }
@@ -817,10 +1136,27 @@ impl IgrfApp {
             config.filter_y.clone(),
             config.filter_z.clone(),
         ];
+        self.calibration = config.calibration.clone();
+        self.sensor_service.calibration = config.calibration.clone();
+
+        self.profile_path = config.setpoint_profile_path.clone();
+        self.slew_rate = config.setpoint_slew_nt_per_second.to_string();
+        if config.setpoint_source_port > 0 {
+            self.setpoint_port = config.setpoint_source_port.to_string();
+        }
+        // A loaded config brings its own setpoints; start the ramp there
+        // rather than sweeping from wherever the last one left off.
+        self.slew = SlewLimiter::new(
+            config.setpoint_slew_nt_per_second,
+            std::array::from_fn(|axis| self.pid_settings[axis].setpoint),
+        );
         self.config = config;
         match problem {
             Some(message) => self.set_error(message),
-            None => self.set_status(format!("Loaded {CONFIG_PATH}")),
+            None => match self.calibration_warning() {
+                Some(warning) => self.set_error(format!("Loaded {CONFIG_PATH}, but {warning}")),
+                None => self.set_status(format!("Loaded {CONFIG_PATH}")),
+            },
         }
     }
 
@@ -832,7 +1168,7 @@ impl IgrfApp {
             _ => self.calculation.reset_filter_z(),
         }
         self.outputs[axis] = 0.0;
-        self.set_status(format!("Reset axis {} PID/filter", ['X', 'Y', 'Z'][axis]));
+        self.set_status(format!("Reset axis {} PID/filter", AXES[axis]));
     }
 
     fn master_reset(&mut self) {
@@ -841,6 +1177,13 @@ impl IgrfApp {
             pid.reset();
         }
         self.calculation.reset_filters();
+        // Leaving a commanded ramp in flight would have the cage climb back
+        // toward the old target the moment an axis is started again.
+        self.slew.snap([0.0; 3]);
+        for settings in &mut self.pid_settings {
+            settings.setpoint = 0.0;
+        }
+        self.profile_started = None;
         self.outputs = [0.0; 3];
         self.filtered = [0.0; 3];
         self.processed = ProcessedData::default();
@@ -881,19 +1224,35 @@ impl IgrfApp {
 
     fn stop_all(&mut self) {
         self.pid_running = [false; 3];
-        self.outputs = [0.0; 3];
+        // A deliberate stop clears the loop: whoever presses this wants the
+        // cage inert, not parked ready to resume.
         for pid in &mut self.pids {
             pid.reset();
         }
-        if self.controller_manager.is_open() {
-            if let Err(error) = write_controller_packet(&mut self.controller_manager, 0.0, 0.0, 0.0)
-            {
-                self.controller_manager.disconnect();
-                self.set_error(format!("STOP ALL: controller write failed: {error}"));
-                return;
-            }
+        self.paused_by_watchdog = [false; 3];
+        self.resume_pending = false;
+        if let Err(error) = self.zero_outputs() {
+            self.set_error(format!("STOP ALL: controller write failed: {error}"));
+            return;
         }
         self.set_status("STOP ALL: every axis paused, outputs zeroed");
+    }
+
+    /// Watchdog pause: coils to zero, but the loop keeps its integral.
+    ///
+    /// Nulling the ambient field puts nearly the whole output in the integral
+    /// term. Clearing it on a one-second sensor dropout means the error jumps
+    /// to the full ambient field on resume and the rebuilt integral overshoots
+    /// into the output limit - a full-scale transient through the 48 V drivers
+    /// every time the USB link hiccups. Holding it makes the resume bumpless.
+    fn watchdog_pause(&mut self) {
+        self.pid_running = [false; 3];
+        for pid in &mut self.pids {
+            pid.hold();
+        }
+        if let Err(error) = self.zero_outputs() {
+            self.set_error(format!("Watchdog pause: controller write failed: {error}"));
+        }
     }
 
     fn show_top_bar(&mut self, ui: &mut egui::Ui) {
@@ -1145,6 +1504,198 @@ impl IgrfApp {
         });
     }
 
+    /// Setpoint command panel: where the field comes from and how fast it may
+    /// change. Everything here is nanotesla.
+    fn show_setpoint_panel(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label("Source");
+            for source in [
+                SetpointSource::Manual,
+                SetpointSource::Profile,
+                SetpointSource::Socket,
+            ] {
+                if ui
+                    .selectable_label(self.setpoint_source == source, source.label())
+                    .clicked()
+                {
+                    self.setpoint_source = source;
+                }
+            }
+        });
+
+        let target = self.slew.target();
+        let current = self.slew.current();
+        let magnitude = |value: [f64; 3]| value.iter().map(|v| v * v).sum::<f64>().sqrt();
+        ui.label(
+            egui::RichText::new(format!(
+                "now {:.1} nT -> target {:.1} nT",
+                magnitude(current),
+                magnitude(target)
+            ))
+            .monospace(),
+        );
+        if !self.slew.is_settled() {
+            ui.label(egui::RichText::new("ramping").small().weak());
+        }
+
+        ui.horizontal(|ui| {
+            ui.label("Slew nT/s");
+            ui.add(egui::TextEdit::singleline(&mut self.slew_rate).desired_width(70.0));
+            if ui.button("Set").clicked() {
+                match parse_f64(&self.slew_rate, "slew rate") {
+                    Ok(rate) if rate > 0.0 => {
+                        self.config.setpoint_slew_nt_per_second = rate;
+                        self.set_status(format!("Setpoint ramps at {rate:.0} nT/s"));
+                    }
+                    Ok(_) => self.set_error("Slew rate must be above zero"),
+                    Err(error) => self.set_error(format!("Slew rate: {error}")),
+                }
+            }
+        });
+
+        match self.setpoint_source {
+            SetpointSource::Manual => {
+                ui.separator();
+                ui.label("Command |B| along the WMM direction");
+                ui.horizontal(|ui| {
+                    ui.label("|B| nT");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.manual_magnitude).desired_width(80.0),
+                    );
+                    if ui.button("Command").clicked() {
+                        self.apply_manual_magnitude();
+                    }
+                });
+                match self.manual_result {
+                    Some(wmm) => ui.label(
+                        egui::RichText::new(format!(
+                            "direction D {:.2} deg, I {:.2} deg",
+                            wmm.declination, wmm.inclination
+                        ))
+                        .small()
+                        .weak(),
+                    ),
+                    None => ui.label(
+                        egui::RichText::new("run the WMM2025 calculation for a direction")
+                            .small()
+                            .weak(),
+                    ),
+                };
+                if let Some(error) = &self.manual_setpoint_error {
+                    ui.colored_label(Color32::LIGHT_RED, error);
+                }
+                ui.label(
+                    egui::RichText::new("per-axis setpoints stay editable on each axis card")
+                        .small()
+                        .weak(),
+                );
+            }
+            SetpointSource::Profile => {
+                ui.separator();
+                ui.label("CSV: time_s,bx_nt,by_nt,bz_nt");
+                ui.horizontal(|ui| {
+                    ui.add(egui::TextEdit::singleline(&mut self.profile_path).desired_width(150.0));
+                    if ui.button("Load").clicked() {
+                        self.load_setpoint_profile();
+                    }
+                });
+                match &self.profile {
+                    Some(profile) => {
+                        let rows = profile.len();
+                        let duration = profile.duration_s();
+                        ui.label(
+                            egui::RichText::new(format!("{rows} rows, {duration:.1}s"))
+                                .small()
+                                .weak(),
+                        );
+                        ui.horizontal(|ui| {
+                            let running = self.profile_started.is_some();
+                            if ui.button(if running { "Stop" } else { "Play" }).clicked() {
+                                self.profile_started = (!running).then(Instant::now);
+                            }
+                            if let Some(started) = self.profile_started {
+                                ui.label(
+                                    egui::RichText::new(format!(
+                                        "t = {:.1}s",
+                                        started.elapsed().as_secs_f64()
+                                    ))
+                                    .monospace(),
+                                );
+                            }
+                        });
+                    }
+                    None => {
+                        ui.label(egui::RichText::new("no profile loaded").small().weak());
+                    }
+                }
+            }
+            SetpointSource::Socket => {
+                ui.separator();
+                ui.horizontal(|ui| {
+                    ui.label("UDP port");
+                    ui.add(egui::TextEdit::singleline(&mut self.setpoint_port).desired_width(64.0));
+                    if self.setpoint_server.is_listening() {
+                        if ui.button("Stop").clicked() {
+                            self.stop_setpoint_server();
+                        }
+                    } else if ui.button("Listen").clicked() {
+                        self.start_setpoint_server();
+                    }
+                });
+                ui.label(
+                    egui::RichText::new(if self.setpoint_server.is_listening() {
+                        "listening - send \"bx,by,bz\" in nT, newest datagram wins"
+                    } else {
+                        "stopped"
+                    })
+                    .small()
+                    .weak(),
+                );
+            }
+        }
+    }
+
+    /// Sensor calibration. These belong to the physical unit in the cage, so
+    /// re-fitting the ellipsoid must not need a rebuild.
+    fn show_calibration_panel(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            ui.label("nT/count");
+            ui.add(
+                egui::DragValue::new(&mut self.calibration.count_to_nt)
+                    .speed(0.001)
+                    .range(1e-6..=1e6),
+            );
+        });
+        ui.label(egui::RichText::new("Hard iron nT").small().weak());
+        egui::Grid::new("hard-iron-grid")
+            .num_columns(3)
+            .show(ui, |ui| {
+                for value in &mut self.calibration.hard_iron {
+                    ui.add(egui::DragValue::new(value).speed(1.0));
+                }
+                ui.end_row();
+            });
+        ui.label(egui::RichText::new("Soft iron").small().weak());
+        egui::Grid::new("soft-iron-grid")
+            .num_columns(3)
+            .show(ui, |ui| {
+                for row in &mut self.calibration.soft_iron {
+                    for value in row {
+                        ui.add(egui::DragValue::new(value).speed(0.0001).max_decimals(6));
+                    }
+                    ui.end_row();
+                }
+            });
+        if let Some(warning) = self.calibration_warning() {
+            ui.colored_label(Color32::LIGHT_RED, warning);
+        }
+        ui.label(
+            egui::RichText::new("Save SystemConfig.json to keep these")
+                .small()
+                .weak(),
+        );
+    }
+
     fn show_manual_panel(&mut self, ui: &mut egui::Ui) {
         ui.label("Default date is fixed at 2025-01-01 (valid WMM2025 date).");
         egui::Grid::new("manual-wmm-grid")
@@ -1194,6 +1745,9 @@ impl IgrfApp {
     /// nothing that can stop an axis hides behind navigation.
     fn axis_column(&mut self, ui: &mut egui::Ui, axis: usize) {
         let label = AXES[axis];
+        let target = self.slew.target();
+        let mut command = None;
+        let mut pause = false;
         ui.group(|ui| {
             ui.set_min_width(ui.available_width().max(0.0));
             let running = self.pid_running[axis];
@@ -1202,7 +1756,7 @@ impl IgrfApp {
                 if ui.button(if running { "Pause" } else { "Start" }).clicked() {
                     self.pid_running[axis] = !running;
                     if !self.pid_running[axis] {
-                        self.outputs[axis] = 0.0;
+                        pause = true;
                     }
                 }
                 if ui.button("Reset").clicked() {
@@ -1226,7 +1780,7 @@ impl IgrfApp {
                     .size(26.0)
                     .strong(),
             );
-            ui.label(egui::RichText::new("filtered").small().weak());
+            ui.label(egui::RichText::new("filtered nT").small().weak());
             ui.label(format!("set {:+.3}", self.pid_settings[axis].setpoint));
             if self.pid_settings[axis].setpoint == 0.0 {
                 // A percentage against a zero setpoint is undefined, and
@@ -1282,14 +1836,50 @@ impl IgrfApp {
                         ("Kp", &mut self.pid_settings[axis].kp),
                         ("Ki", &mut self.pid_settings[axis].ki),
                         ("Kd", &mut self.pid_settings[axis].kd),
-                        ("Min out", &mut self.pid_settings[axis].min_output),
-                        ("Max out", &mut self.pid_settings[axis].max_output),
-                        ("Setpoint", &mut self.pid_settings[axis].setpoint),
                     ] {
                         ui.label(name);
                         ui.add(egui::DragValue::new(value).speed(0.1));
                         ui.end_row();
                     }
+                    // Bounded by what the firmware acts on rather than by
+                    // taste: past its ceiling the raw value goes into a 16-bit
+                    // CCR and truncates, so a bigger number is a smaller field.
+                    let ceiling = FIRMWARE_MAX_OUTPUT[axis];
+                    ui.label("Min out");
+                    ui.add(
+                        egui::DragValue::new(&mut self.pid_settings[axis].min_output)
+                            .speed(1.0)
+                            .range(-ceiling..=0.0),
+                    );
+                    ui.end_row();
+                    ui.label("Max out");
+                    ui.add(
+                        egui::DragValue::new(&mut self.pid_settings[axis].max_output)
+                            .speed(1.0)
+                            .range(0.0..=ceiling),
+                    );
+                    ui.end_row();
+                    ui.label(
+                        egui::RichText::new(format!("firmware ceiling {ceiling:.0}"))
+                            .small()
+                            .weak(),
+                    );
+                    ui.end_row();
+                    // The live setpoint is owned by the ramp, so editing it
+                    // here commands a new target rather than writing the value
+                    // the PID reads this tick - otherwise the next tick would
+                    // overwrite whatever was typed.
+                    ui.label("Setpoint nT");
+                    let mut commanded = target[axis];
+                    if ui
+                        .add(egui::DragValue::new(&mut commanded).speed(1.0))
+                        .changed()
+                    {
+                        let mut field = target;
+                        field[axis] = commanded;
+                        command = Some(field);
+                    }
+                    ui.end_row();
                 });
             ui.label(egui::RichText::new("Kalman filter").small().weak());
             egui::Grid::new(format!("filter-grid-{axis}"))
@@ -1306,13 +1896,25 @@ impl IgrfApp {
                     }
                 });
         });
+        if pause {
+            // Pausing one axis stops that axis' PID, but the controller holds
+            // whatever it was last sent for all three. Push a packet now with
+            // this axis at zero instead of waiting for the next tick.
+            self.pids[axis].hold();
+            self.outputs[axis] = 0.0;
+            self.write_outputs();
+        }
+        if let Some(field) = command {
+            self.setpoint_source = SetpointSource::Manual;
+            self.command_setpoint(field);
+        }
     }
 
     fn show_axis_row(&mut self, ui: &mut egui::Ui) {
         if fits_columns(ui, 3) {
             ui.columns(3, |columns| {
-                for axis in 0..3 {
-                    self.axis_column(&mut columns[axis], axis);
+                for (axis, column) in columns.iter_mut().enumerate() {
+                    self.axis_column(column, axis);
                 }
             });
         } else {
@@ -1374,7 +1976,7 @@ impl IgrfApp {
             show_plot(
                 ui,
                 &format!("sensor-plot-{axis}"),
-                &format!("{}: setpoint vs measured", AXES[axis]),
+                &format!("{} nT: setpoint vs measured", AXES[axis]),
                 &[
                     (
                         "Setpoint",
@@ -1392,8 +1994,8 @@ impl IgrfApp {
         };
         if fits_columns(ui, 3) {
             ui.columns(3, |columns| {
-                for axis in 0..3 {
-                    axis_plot(&mut columns[axis], axis);
+                for (axis, column) in columns.iter_mut().enumerate() {
+                    axis_plot(column, axis);
                 }
             });
         } else {
@@ -1423,7 +2025,7 @@ impl IgrfApp {
             show_plot(
                 ui,
                 "sensor-magnitude-plot",
-                "|B|: setpoint vs measured",
+                "|B| nT: setpoint vs measured",
                 &[
                     (
                         "Setpoint",
@@ -1443,7 +2045,7 @@ impl IgrfApp {
             show_plot(
                 ui,
                 "magson-plot",
-                "Magson X/Y/Z/total",
+                "Magson X/Y/Z/total (nT)",
                 &[
                     ("X", &self.history.magson[0], Color32::LIGHT_RED),
                     ("Y", &self.history.magson[1], Color32::LIGHT_GREEN),
@@ -1460,6 +2062,8 @@ impl IgrfApp {
 
 impl Drop for IgrfApp {
     fn drop(&mut self) {
+        let _ = self.zero_outputs();
+        self.setpoint_server.disconnect();
         self.sensor_manager.disconnect();
         self.controller_manager.disconnect();
         self.magson_client.disconnect();
@@ -1504,6 +2108,12 @@ impl eframe::App for IgrfApp {
                     egui::CollapsingHeader::new("LAN static IP")
                         .default_open(false)
                         .show(ui, |ui| self.show_lan_panel(ui));
+                    egui::CollapsingHeader::new("Setpoint command")
+                        .default_open(true)
+                        .show(ui, |ui| self.show_setpoint_panel(ui));
+                    egui::CollapsingHeader::new("Sensor calibration")
+                        .default_open(false)
+                        .show(ui, |ui| self.show_calibration_panel(ui));
                     egui::CollapsingHeader::new("Config / logging")
                         .default_open(true)
                         .show(ui, |ui| self.show_config_panel(ui));
@@ -1784,6 +2394,77 @@ mod tests {
         assert!(parse_tcp_port("70000").is_err());
         assert!(parse_f64("NaN", "x").is_err());
         assert_eq!(parse_u8("12", "day"), Ok(12));
+    }
+
+    /// The watchdog path must not throw away the standing current, and STOP
+    /// ALL must. Guarding the distinction here because the difference is
+    /// invisible until a real dropout on real hardware.
+    #[test]
+    fn a_watchdog_pause_keeps_the_integral_that_a_deliberate_stop_clears() {
+        let mut pid = PidController::default();
+        pid.ki = 0.0679;
+        for _ in 0..50 {
+            pid.calculate(0.0, 40_000.0);
+        }
+        let standing = pid.integral();
+        assert!(standing != 0.0);
+
+        pid.hold();
+        assert_eq!(pid.integral(), standing);
+
+        pid.reset();
+        assert_eq!(pid.integral(), 0.0);
+    }
+
+    /// The CSV is the only record a month-long unattended run leaves behind,
+    /// so the column count has to match the header exactly or every downstream
+    /// script silently reads shifted fields.
+    /// The CSV is the only record a month-long unattended run leaves behind,
+    /// so a row has to line up with the header exactly: a mismatch shifts every
+    /// field in every downstream script without any error to notice.
+    #[test]
+    fn a_snapshot_row_has_one_field_per_header_column() {
+        let row = IgrfApp::snapshot_row(
+            "2026-08-25 00:00:00.000",
+            [1.0, 2.0, 3.0],
+            [4.0, 5.0, 6.0],
+            [7.0, 8.0, 9.0],
+            &[
+                PidSettings::default(),
+                PidSettings::default(),
+                PidSettings::default(),
+            ],
+            [10.0; 3],
+            [11.0, 12.0, 13.0],
+            [14.0, 15.0, 16.0],
+            Duration::from_millis(117),
+        );
+
+        assert_eq!(
+            row.split(',').count(),
+            LOG_HEADER.split(',').count(),
+            "row: {row}"
+        );
+        assert!(
+            row.ends_with(",117.0"),
+            "the tick interval is the last column"
+        );
+    }
+
+    #[test]
+    fn soft_iron_asymmetry_flags_the_mistyped_digit_but_not_a_real_fit() {
+        let good = CalibrationSettings {
+            soft_iron: [
+                [0.9958, -0.0050, 0.0064],
+                [-0.0050, 1.0042, -0.0087],
+                [0.0064, -0.0087, 1.0003],
+            ],
+            ..Default::default()
+        };
+        assert!(good.asymmetry() <= SOFT_IRON_ASYMMETRY_LIMIT);
+
+        // The shipped default has -0.050 where -0.0050 belongs.
+        assert!(CalibrationSettings::default().asymmetry() > SOFT_IRON_ASYMMETRY_LIMIT);
     }
 
     #[test]

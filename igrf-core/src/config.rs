@@ -48,6 +48,11 @@ pub struct FilterSettings {
     pub q: f64,
     #[serde(rename = "R", default = "default_measurement_noise")]
     pub r: f64,
+    /// Jump between consecutive samples, in nT, that is read as a glitch. See
+    /// [`crate::DEFAULT_SPIKE_THRESHOLD_NT`]; raising
+    /// `SetpointSlewNtPerSecond` well past 10 nT per ms needs this raised too.
+    #[serde(rename = "SpikeNt", default = "default_spike_threshold")]
+    pub spike_nt: f64,
 }
 
 fn default_process_noise() -> f64 {
@@ -58,11 +63,16 @@ fn default_measurement_noise() -> f64 {
     100.0
 }
 
+fn default_spike_threshold() -> f64 {
+    crate::DEFAULT_SPIKE_THRESHOLD_NT
+}
+
 impl Default for FilterSettings {
     fn default() -> Self {
         Self {
             q: default_process_noise(),
             r: default_measurement_noise(),
+            spike_nt: default_spike_threshold(),
         }
     }
 }
@@ -77,6 +87,12 @@ impl FilterSettings {
         }
         if !self.r.is_finite() || self.r <= 0.0 {
             self.r = defaults.r;
+        }
+        // A zero or negative threshold rejects every sample until
+        // `max_consecutive_rejects` forces a filter reset, which is a sensor
+        // that reports nothing rather than one that reports noise.
+        if !self.spike_nt.is_finite() || self.spike_nt <= 0.0 {
+            self.spike_nt = defaults.spike_nt;
         }
     }
 }
@@ -516,13 +532,30 @@ mod tests {
     #[test]
     fn filter_settings_reject_values_that_would_poison_the_kalman_gain() {
         for bad in [0.0, -1.0, f64::NAN, f64::INFINITY] {
-            let mut settings = FilterSettings { q: bad, r: bad };
+            let mut settings = FilterSettings {
+                q: bad,
+                r: bad,
+                spike_nt: bad,
+            };
             settings.sanitize();
             assert_eq!(settings, FilterSettings::default(), "rejected {bad}");
         }
-        let mut kept = FilterSettings { q: 0.5, r: 25.0 };
-        kept.sanitize();
-        assert_eq!(kept, FilterSettings { q: 0.5, r: 25.0 });
+        let kept = FilterSettings {
+            q: 0.5,
+            r: 25.0,
+            spike_nt: 2500.0,
+        };
+        let mut sanitized = kept.clone();
+        sanitized.sanitize();
+        assert_eq!(sanitized, kept);
+    }
+
+    /// A config written before `SpikeNt` existed still has to load, and has to
+    /// land on the working default rather than on zero.
+    #[test]
+    fn a_filter_block_without_a_spike_threshold_takes_the_default() {
+        let settings: FilterSettings = serde_json::from_str(r#"{"Q": 1.0, "R": 500.0}"#).unwrap();
+        assert_eq!(settings.spike_nt, crate::DEFAULT_SPIKE_THRESHOLD_NT);
     }
 
     #[test]

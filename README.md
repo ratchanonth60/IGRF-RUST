@@ -46,6 +46,23 @@ behaviour can be confirmed against a magnetometer rather than trusted from the
 disassembly. Run it with `--dry-run` first; it bypasses the PID and the
 app-side clamp.
 
+## Watchdogs
+
+The loop stops driving the coils on any of three faults, and the same gate
+decides when it may resume, so a pause and a resume cannot disagree:
+
+| Fault | Meaning |
+| --- | --- |
+| Controller link down | The serial port closed. Nothing reaches the coils, and the firmware has no receive timeout, so they hold their last command until the port reopens. |
+| Sensor frozen | Packets still arrive but the raw counts have not moved for 5 s. One HMR2300 count is 6.667 nT and its noise floor is larger, so three axes sitting exactly still is a dead sensor, not a quiet cage. |
+| Sensor stale | No packet for 5 s. |
+
+Both ports reopen by themselves every 10 s while the operator has them marked
+connected. A controller reconnect zeroes the outputs before anything else,
+because the coils were still energised the whole time it was gone. "Resume PID
+after auto-reconnect" decides whether the loop restarts itself; leave it off
+for anything attended.
+
 ## CSV columns
 
 The first 28 columns are the C# row, unchanged, so existing analysis scripts
@@ -55,6 +72,30 @@ keep working. This build appends four:
 | --- | --- |
 | `CmdX/Y/Z` | The commanded setpoint, before the slew limiter. `SetX/Y/Z` is where the ramp has reached this tick, so the pair tells a slow ramp from a small command. |
 | `TickMs` | The real PID interval for that row. A nominal 100 ms tick lands anywhere from 100 to 133 ms. |
+
+## Kalman filter
+
+`FilterX/Y/Z` in `SystemConfig.json` carry three numbers each:
+
+| Field | Meaning |
+| --- | --- |
+| `Q` | Process noise, nT^2 per 100 ms tick: how far the field is assumed to wander on its own. Scaled by the real interval, so display jitter does not move the gain. |
+| `R` | Measurement noise, nT^2. The shipped 500/200/150 imply 22/14/12 nT rms, against 1.9 nT of pure quantisation. |
+| `SpikeNt` | Jump between samples, in nT, that is read as a glitch instead of a field. |
+
+The filter is told what the setpoint ramp commanded since the last sample, so a
+ramp is predicted rather than discovered. Without that, `Q = 1` against
+`R = 500` is a 2.24 s time constant, and the default 5000 nT/s slew settles
+**10933 nT behind the truth on X** - an error the PID fights and the CSV
+records as real field.
+
+Two consequences worth knowing:
+
+- Raising `SetpointSlewNtPerSecond` far past 50000 needs `SpikeNt` raised with
+  it, or the rejector spends ten samples fighting every ramp.
+- `R` sets the loop's ceiling. Usable bandwidth is about `1/(2*pi*tau)`:
+  0.07 Hz on X, 0.11 Hz on Y, 0.13 Hz on Z. No PID gain gets past that; lower
+  `R` first.
 
 ## Sensor calibration
 
@@ -66,6 +107,20 @@ rebuild.
 An ellipsoid fit produces a symmetric soft-iron matrix, so the app warns when
 one is not: at 50000 nT on one axis, an asymmetry of 0.045 leaks 2250 nT into
 another, which reads as a cage uniformity problem rather than a config typo.
+
+## Magson (second magnetometer)
+
+Display and logging only: the `Mag2*` CSV columns come from here, and nothing
+in the control loop reads them. The reading is cleared when the link drops, so
+a dead connection does not keep publishing its last sample.
+
+**The frame decode is not confirmed.** `parse_magson_frame` reads the three
+floats at offsets 48/52/56 of a 72-byte frame, which is what the C# build did,
+but logged values are not physical - three axes near 65000 with variances two
+orders of magnitude apart, and `Mag2X` sawtoothing like a counter. The frame
+specification would settle it. Until then the parser also cannot resynchronise:
+it consumes 72 bytes at a time with no framing, so a single lost byte silently
+ends the stream for the rest of the run. Both wait on the same document.
 
 ## Setpoint sources
 
@@ -117,6 +172,15 @@ line, then push to `main`.
 - `v0.x.0`: new features or configuration fields
 - `v1.0.0`: stable hardware/protocol contract
 
+`v0.4.0` stops the loop when the controller link drops - it previously kept
+integrating against a field it could no longer move - and reopens that port by
+itself the way the sensor port already did. It also feeds the commanded ramp to the Kalman filter as a control input, scales
+its process noise by the real sample interval, and replaces a spike
+threshold that could never fire (300000 nT, above the sensor's own 200000 nT
+full scale) with a configurable `SpikeNt`. Filtered field values during a ramp
+differ from `v0.3.0` by up to 11000 nT, because `v0.3.0` was lagging; steady
+state is unchanged.
+
 `v0.3.0` counts the packets the controller rejects and shows them on the
 controller panel, binds the setpoint listener to loopback unless
 `SetpointSourceBindAddress` says otherwise, and pauses the loop when the sensor
@@ -135,7 +199,7 @@ to move before the merge or two releases claim the same one.
 To tag by hand instead:
 
 ```bash
-git tag -a v0.3.0 -m "Release v0.3.0"
+git tag -a v0.4.0 -m "Release v0.4.0"
 git push origin master --follow-tags
 ```
 

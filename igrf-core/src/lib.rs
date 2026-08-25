@@ -8,7 +8,9 @@ mod pid;
 mod sensor;
 mod setpoint;
 
-pub use calculation::{CalculationError, CalculationService, ProcessedData};
+pub use calculation::{
+    CalculationError, CalculationService, ProcessedData, DEFAULT_SPIKE_THRESHOLD_NT,
+};
 pub use config::{AppConfig, CalibrationSettings, FilterSettings, PidSettings};
 pub use kalman::KalmanFilter;
 pub use map_grid::MapGrid;

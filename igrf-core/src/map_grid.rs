@@ -31,6 +31,9 @@ impl MapGrid {
         let longitudes = (0..cols).map(|col| -180.0 + (col * step) as f64).collect();
         let mut data = vec![vec![0.0; rows]; cols];
 
+        // `data` is [col][row], so neither loop variable indexes the vector it
+        // iterates and clippy's enumerate() rewrite would transpose the grid.
+        #[allow(clippy::needless_range_loop)]
         for row in 0..rows {
             let Some(line) = lines.get(row * step) else {
                 continue;

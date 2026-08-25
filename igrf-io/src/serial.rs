@@ -58,18 +58,10 @@ impl SensorFrameParser {
     }
 }
 
+#[derive(Default)]
 pub struct SerialPortManager {
     port: Option<Box<dyn SerialPort>>,
     parser: SensorFrameParser,
-}
-
-impl Default for SerialPortManager {
-    fn default() -> Self {
-        Self {
-            port: None,
-            parser: SensorFrameParser::default(),
-        }
-    }
 }
 
 impl SerialPortManager {
@@ -144,7 +136,7 @@ impl Write for SerialPortManager {
     fn write(&mut self, data: &[u8]) -> io::Result<usize> {
         SerialPortManager::write(self, data)
             .map(|_| data.len())
-            .map_err(|error| io::Error::new(io::ErrorKind::Other, error.to_string()))
+            .map_err(|error| io::Error::other(error.to_string()))
     }
 
     fn flush(&mut self) -> io::Result<()> {

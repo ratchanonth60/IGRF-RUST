@@ -1,10 +1,8 @@
-const SCALE: f64 = 20.0 / 3.0;
-const HARD_IRON: [f64; 3] = [1349.5, 4110.95, -1343.37];
-const SOFT_IRON: [[f64; 3]; 3] = [
-    [0.9958, -0.0050, 0.0064],
-    [-0.050, 1.0042, -0.0087],
-    [0.0064, -0.0087, 1.0003],
-];
+use crate::CalibrationSettings;
+
+/// HMR2300 full scale is +-2 G over +-30000 counts, so one count is 6.667 nT.
+/// Every field value in this crate is nanotesla from here on.
+pub const DEFAULT_COUNT_TO_NT: f64 = 20.0 / 3.0;
 
 #[derive(Debug, Default, PartialEq, Clone, Copy)]
 pub struct RawSensorData {
@@ -13,29 +11,28 @@ pub struct RawSensorData {
     pub mag_z: f64,
 }
 
+#[derive(Default)]
 pub struct SensorService {
     pub reference_x: f64,
     pub reference_y: f64,
     pub reference_z: f64,
+    /// Scale, hard-iron and soft-iron terms for the sensor physically mounted
+    /// in the cage. Moving or re-fitting the sensor changes these, so they live
+    /// in `SystemConfig.json` instead of the binary.
+    pub calibration: CalibrationSettings,
     last_raw_x: f64,
     last_raw_y: f64,
     last_raw_z: f64,
 }
 
-impl Default for SensorService {
-    fn default() -> Self {
+impl SensorService {
+    pub fn with_calibration(calibration: CalibrationSettings) -> Self {
         Self {
-            reference_x: 0.0,
-            reference_y: 0.0,
-            reference_z: 0.0,
-            last_raw_x: 0.0,
-            last_raw_y: 0.0,
-            last_raw_z: 0.0,
+            calibration,
+            ..Default::default()
         }
     }
-}
 
-impl SensorService {
     pub fn process_data(&mut self, packet: &[u8]) -> RawSensorData {
         if packet.len() < 7 {
             return RawSensorData::default();
@@ -44,23 +41,25 @@ impl SensorService {
         let raw_x = i16::from_be_bytes([packet[0], packet[1]]);
         let raw_y = i16::from_be_bytes([packet[2], packet[3]]);
         let raw_z = i16::from_be_bytes([packet[4], packet[5]]);
+        let scale = self.calibration.count_to_nt;
         let mag = [
-            raw_x as f64 * SCALE,
-            raw_y as f64 * SCALE,
-            raw_z as f64 * SCALE,
+            raw_x as f64 * scale,
+            raw_y as f64 * scale,
+            raw_z as f64 * scale,
         ];
 
         self.last_raw_x = mag[0];
         self.last_raw_y = mag[1];
         self.last_raw_z = mag[2];
 
+        let hard_iron = self.calibration.hard_iron;
         let mag_hi = [
-            mag[0] - HARD_IRON[0] - self.reference_x,
-            mag[1] - HARD_IRON[1] - self.reference_y,
-            mag[2] - HARD_IRON[2] - self.reference_z,
+            mag[0] - hard_iron[0] - self.reference_x,
+            mag[1] - hard_iron[1] - self.reference_y,
+            mag[2] - hard_iron[2] - self.reference_z,
         ];
         let mut mag_cal = [0.0; 3];
-        for (i, row) in SOFT_IRON.iter().enumerate() {
+        for (i, row) in self.calibration.soft_iron.iter().enumerate() {
             mag_cal[i] = row[0] * mag_hi[0] + row[1] * mag_hi[1] + row[2] * mag_hi[2];
         }
 
@@ -100,10 +99,12 @@ mod tests {
 
     #[test]
     fn processes_signed_big_endian_axes_and_calibration() {
-        let mut sensor = SensorService::default();
-        sensor.reference_x = 1.0;
-        sensor.reference_y = -2.0;
-        sensor.reference_z = 3.0;
+        let mut sensor = SensorService {
+            reference_x: 1.0,
+            reference_y: -2.0,
+            reference_z: 3.0,
+            ..Default::default()
+        };
         let result = sensor.process_data(&[0x12, 0x34, 0xFF, 0xFE, 0x80, 0x00, 0x0D]);
 
         close(sensor.last_raw_x(), 31066.666666666668);

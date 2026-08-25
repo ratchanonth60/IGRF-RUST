@@ -162,7 +162,7 @@ impl UtcDateTime {
         let d = self.day as f64
             + self.hour as f64 / 24.0
             + self.minute as f64 / 1440.0
-            + (self.second as f64 + self.millisecond as f64 * 1000.0) / 86400.0;
+            + (self.second as f64 + self.millisecond as f64 / 1000.0) / 86400.0;
         let b = if is_julian {
             0
         } else {
@@ -172,6 +172,12 @@ impl UtcDateTime {
             - 1524.5
     }
 }
+
+/// The radius the WMM spherical-harmonic expansion is defined against
+/// (WMM2025 technical report, eq. 1). It is a model constant, not a property of
+/// the ellipsoid: using the WGS 84 mean radius instead scales the field by
+/// roughly 1e-4 and misses the published test values by about 4 nT.
+const GEOMAGNETIC_REFERENCE_RADIUS_KM: f64 = 6371.2;
 
 fn days_in_month(year: i32, month: u8) -> u8 {
     match month {
@@ -232,28 +238,21 @@ pub struct GeomagnetismResult {
 
 impl GeomagnetismResult {
     fn new(coordinate: CoordinateZ, date: UtcDateTime, x: f64, y: f64, z: f64) -> Self {
-        let mut result = Self {
+        // atan2 is defined at the origin, so a near-zero component needs no
+        // guard: blanking the whole vector would report a field of zero for a
+        // location that merely has no eastward component.
+        let horizontal_intensity = (x * x + y * y).sqrt();
+        Self {
             coordinate,
             date,
-            x: 0.0,
-            y: 0.0,
-            z: 0.0,
-            declination: 0.0,
-            inclination: 0.0,
-            total_intensity: 0.0,
-            horizontal_intensity: 0.0,
-        };
-        if (x - 0.0).abs() < f64::EPSILON * 2.0 || (y - 0.0).abs() < f64::EPSILON * 2.0 {
-            return result;
+            x,
+            y,
+            z,
+            declination: y.atan2(x).to_degrees(),
+            inclination: z.atan2(horizontal_intensity).to_degrees(),
+            total_intensity: (x * x + y * y + z * z).sqrt(),
+            horizontal_intensity,
         }
-        result.x = x;
-        result.y = y;
-        result.z = z;
-        result.horizontal_intensity = (x * x + y * y).sqrt();
-        result.total_intensity = (x * x + y * y + z * z).sqrt();
-        result.declination = y.atan2(x).to_degrees();
-        result.inclination = z.atan2(result.horizontal_intensity).to_degrees();
-        result
     }
 }
 
@@ -378,7 +377,7 @@ impl GeomagnetismCalculator {
         let mut b_radial = 0.0;
         let mut b_theta = 0.0;
         let mut b_phi = 0.0;
-        let fn0 = self.spheroid.mean_radius_m() / 1000.0 / r;
+        let fn0 = GEOMAGNETIC_REFERENCE_RADIUS_KM / r;
         let mut factor = fn0 * fn0;
         let mut sm = [0.0_f64; 13];
         let mut cm = [0.0_f64; 13];
@@ -485,6 +484,69 @@ mod tests {
             .abs()
                 < 1e-6
         );
+    }
+
+    /// The official NOAA/BGS WMM2025 test values for 2025.0 (WMM2025 test
+    /// value table). Published to 0.1 nT, so the tolerance is 0.2 nT. The
+    /// finite/self-consistent test above passes for any tidy but wrong field;
+    /// only a real reference vector catches a scale or sign error.
+    #[test]
+    fn wmm2025_matches_the_published_test_values() {
+        // lat, lon, height km, X, Y, Z, H, F, I, D
+        let rows = [
+            (
+                80.0, 0.0, 0.0, 6521.6, 145.9, 54791.5, 6523.2, 55178.5, 83.21, 1.28,
+            ),
+            (
+                0.0, 120.0, 0.0, 39677.8, -109.6, -10580.2, 39677.9, 41064.3, -14.93, -0.16,
+            ),
+            (
+                -80.0, -120.0, 0.0, 6117.5, 15751.9, -52022.5, 16898.1, 54698.2, -72.00, 68.78,
+            ),
+            (
+                80.0, 0.0, 100.0, 6216.0, 92.4, 52598.8, 6216.7, 52964.9, 83.26, 0.85,
+            ),
+            (
+                0.0, 120.0, 100.0, 37688.6, -96.2, -10152.1, 37688.7, 39032.1, -15.08, -0.15,
+            ),
+            (
+                -80.0, -120.0, 100.0, 5907.6, 14780.3, -49540.7, 15917.1, 52035.0, -72.19, 68.21,
+            ),
+        ];
+        let calculator = GeomagnetismCalculator::new();
+
+        for (latitude, longitude, height, x, y, z, h, f, i, d) in rows {
+            let coordinate = Coordinate::new(latitude, longitude).unwrap();
+            let result = calculator
+                .try_calculate_at_altitude(coordinate, height, date(2025, 1, 1))
+                .unwrap()
+                .unwrap();
+            let check = |name: &str, actual: f64, expected: f64, tolerance: f64| {
+                assert!(
+                    (actual - expected).abs() < tolerance,
+                    "{name} at {latitude},{longitude},{height}km: {actual} != {expected}"
+                );
+            };
+
+            check("X", result.x, x, 0.2);
+            check("Y", result.y, y, 0.2);
+            check("Z", result.z, z, 0.2);
+            check("H", result.horizontal_intensity, h, 0.2);
+            check("F", result.total_intensity, f, 0.2);
+            check("I", result.inclination, i, 0.01);
+            check("D", result.declination, d, 0.01);
+        }
+    }
+
+    /// `UtcDateTime::date` pins milliseconds to zero, so the field tests above
+    /// cannot see a bad millisecond scale factor.
+    #[test]
+    fn julian_day_counts_milliseconds_as_thousandths_of_a_second() {
+        let base = UtcDateTime::new(2025, 6, 1, 12, 0, 0, 0).unwrap();
+        let half_second = UtcDateTime::new(2025, 6, 1, 12, 0, 0, 500).unwrap();
+
+        // The Julian day is ~2.46e6, so differencing two of them costs ~5e-10.
+        assert!((half_second.julian_day() - base.julian_day() - 0.5 / 86_400.0).abs() < 1e-8);
     }
 
     #[test]

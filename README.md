@@ -113,11 +113,15 @@ line, then push to `main`.
 
 ## Release versioning
 
-The first release is `v0.1.0`.
-
-- `v0.1.x`: bug fixes and safe hardware-compatible changes
+- `v0.x.y`: bug fixes and safe hardware-compatible changes
 - `v0.x.0`: new features or configuration fields
 - `v1.0.0`: stable hardware/protocol contract
+
+`v0.2.0` adds the setpoint sources, moves sensor calibration into the config,
+and clamps output to what the controller firmware acts on. Field values from
+its WMM2025 calculation differ from `v0.1.0` by roughly 4 nT, because the
+expansion now uses the model's own 6371.2 km reference radius; logs from the
+two releases are not directly comparable.
 
 Create a release locally after the checks pass:
 

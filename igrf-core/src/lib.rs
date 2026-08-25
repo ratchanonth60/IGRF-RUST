@@ -9,7 +9,8 @@ mod sensor;
 mod setpoint;
 
 pub use calculation::{
-    CalculationError, CalculationService, ProcessedData, DEFAULT_SPIKE_THRESHOLD_NT, REJECTS_BEFORE_FAULT,
+    CalculationError, CalculationService, ProcessedData, DEFAULT_SPIKE_THRESHOLD_NT,
+    REJECTS_BEFORE_FAULT,
 };
 pub use config::{AppConfig, CalibrationSettings, FilterSettings, PidSettings};
 pub use kalman::KalmanFilter;

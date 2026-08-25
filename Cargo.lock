@@ -976,7 +976,7 @@ dependencies = [
 
 [[package]]
 name = "igrf-app"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "chrono",
  "eframe",
@@ -988,7 +988,7 @@ dependencies = [
 
 [[package]]
 name = "igrf-core"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -996,7 +996,7 @@ dependencies = [
 
 [[package]]
 name = "igrf-io"
-version = "0.4.1"
+version = "0.4.2"
 dependencies = [
  "chrono",
  "igrf-core",

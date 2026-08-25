@@ -1,0 +1,8 @@
+# Setpoint profile: the commanded field vector over time, in nanotesla.
+# Feed this from an orbit propagator (SGP4 -> position -> IGRF/WMM -> body frame)
+# or write it by hand. Rows are interpolated linearly and held flat past the end.
+time_s,bx_nt,by_nt,bz_nt
+0,0,0,0
+30,39858,-619,20583
+90,39858,-619,20583
+120,0,0,0

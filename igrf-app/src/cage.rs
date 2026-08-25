@@ -52,9 +52,9 @@ pub fn show(ui: &mut egui::Ui, view: &mut CageView, drive: [f64; 3]) {
 
     let dt = ui.input(|input| input.stable_dt).clamp(0.0, 0.1);
     let period = DASH + GAP;
-    for axis in 0..3 {
-        let step = drive[axis].clamp(-1.0, 1.0) as f32 * FLOW_SPEED * dt;
-        view.phase[axis] = (view.phase[axis] - step).rem_euclid(period);
+    for (phase, drive) in view.phase.iter_mut().zip(drive) {
+        let step = drive.clamp(-1.0, 1.0) as f32 * FLOW_SPEED * dt;
+        *phase = (*phase - step).rem_euclid(period);
     }
 
     let rect = response.rect;
@@ -64,8 +64,7 @@ pub fn show(ui: &mut egui::Ui, view: &mut CageView, drive: [f64; 3]) {
 
     // Painter's algorithm: far loops first so near ones draw over them.
     let mut loops: Vec<(usize, Vec<Pos2>, f32)> = Vec::with_capacity(6);
-    for axis in 0..3 {
-        let half = HALF_SIDE[axis];
+    for (axis, half) in HALF_SIDE.into_iter().enumerate() {
         for side in [-1.0, 1.0] {
             let projected: Vec<(Pos2, f32)> = square_loop(axis, side * SEPARATION * half, half)
                 .iter()

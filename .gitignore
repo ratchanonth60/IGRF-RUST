@@ -4,3 +4,9 @@
 /SystemConfig.json
 *.json.tmp
 .DS_Store
+
+# Controller firmware dump. Kept out of the repo deliberately: this is a public
+# mirror and the dump is a full flash image of the STM32. What was learned from
+# it is written up in docs/controller-protocol.md instead.
+/test.bin
+__pycache__/

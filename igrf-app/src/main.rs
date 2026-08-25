@@ -9,7 +9,7 @@ use igrf_core::geomagnetism::{
 use igrf_core::{
     field_from_magnitude, AppConfig, CalculationService, CalibrationSettings, FilterSettings,
     PidController, PidSettings, ProcessedData, SensorService, SetpointProfile, SlewLimiter,
-    FIRMWARE_MAX_OUTPUT, NOMINAL_TICK_SECONDS,
+    FIRMWARE_MAX_OUTPUT, NOMINAL_TICK_SECONDS, REJECTS_BEFORE_FAULT,
 };
 use igrf_io::{
     write_controller_packet, ControllerReplyCounter, CsvLogger, MagsonSample, MagsonTcpClient,
@@ -1069,6 +1069,7 @@ impl IgrfApp {
         }
         let fault = loop_fault(
             self.controller_manager.is_open(),
+            self.calculation.consecutive_rejects(),
             self.sensor_age(),
             self.sensor_change_age(),
         );
@@ -1079,6 +1080,12 @@ impl IgrfApp {
                         "controller link down; the coils hold their last command until it reopens"
                             .to_owned()
                     }
+                    LoopFault::SensorRejected => format!(
+                        "{} readings in a row rejected as spikes; the loop was being fed held \
+                         values, not measurements. Raise SpikeNt in {CONFIG_PATH} if the field \
+                         really moves that fast.",
+                        self.calculation.consecutive_rejects()
+                    ),
                     LoopFault::SensorFrozen => format!(
                         "sensor readings unchanged for {:.1}s",
                         self.sensor_change_age().unwrap_or_default().as_secs_f64()
@@ -2487,6 +2494,7 @@ fn sensor_is_frozen(age: Option<Duration>) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LoopFault {
     ControllerDown,
+    SensorRejected,
     SensorFrozen,
     SensorStale,
 }
@@ -2497,15 +2505,24 @@ enum LoopFault {
 /// Ordered by what the operator has to deal with first. A controller that is
 /// gone makes the sensor's state irrelevant - and is the worse fault, because
 /// the firmware has no receive timeout and holds its last command until the
-/// port reopens. A frozen sensor outranks a silent one only because it is the
-/// more specific diagnosis of the two.
+/// port reopens. A run of rejected samples comes next: it is invisible to both
+/// sensor checks, because the packets keep arriving and keep changing. A frozen
+/// sensor outranks a silent one only because it is the more specific diagnosis
+/// of the two.
 fn loop_fault(
     controller_open: bool,
+    consecutive_rejects: i32,
     sensor_age: Option<Duration>,
     sensor_change_age: Option<Duration>,
 ) -> Option<LoopFault> {
     if !controller_open {
         return Some(LoopFault::ControllerDown);
+    }
+    // Outranks both sensor faults: the packets are arriving and changing, so
+    // neither of those fires, but the PID is being handed the filter's last
+    // state instead of any of it.
+    if consecutive_rejects >= REJECTS_BEFORE_FAULT {
+        return Some(LoopFault::SensorRejected);
     }
     if sensor_is_frozen(sensor_change_age) {
         return Some(LoopFault::SensorFrozen);
@@ -2705,13 +2722,16 @@ mod tests {
     #[test]
     fn a_missing_controller_stops_the_loop_even_with_a_perfect_sensor() {
         let fresh = Some(Duration::ZERO);
-        assert_eq!(loop_fault(true, fresh, fresh), None);
+        assert_eq!(loop_fault(true, 0, fresh, fresh), None);
         assert_eq!(
-            loop_fault(false, fresh, fresh),
+            loop_fault(false, 0, fresh, fresh),
             Some(LoopFault::ControllerDown)
         );
         // Never reported yet is not a controller fault, only a sensor one.
-        assert_eq!(loop_fault(true, None, None), Some(LoopFault::SensorStale));
+        assert_eq!(
+            loop_fault(true, 0, None, None),
+            Some(LoopFault::SensorStale)
+        );
     }
 
     /// Pause and resume read the same gate, so a fault cleared for one is
@@ -2723,16 +2743,37 @@ mod tests {
         let stuck = Some(SENSOR_FROZEN_TIMEOUT + Duration::from_secs(1));
 
         assert_eq!(
-            loop_fault(false, stale, stuck),
+            loop_fault(false, 0, stale, stuck),
             Some(LoopFault::ControllerDown)
         );
         assert_eq!(
-            loop_fault(true, stale, stuck),
+            loop_fault(true, 0, stale, stuck),
             Some(LoopFault::SensorFrozen)
         );
         assert_eq!(
-            loop_fault(true, stale, Some(Duration::ZERO)),
+            loop_fault(true, 0, stale, Some(Duration::ZERO)),
             Some(LoopFault::SensorStale)
+        );
+    }
+
+    /// The v0.4.0 failure. Packets keep arriving and keep changing, so neither
+    /// sensor check fires, but every one of them is being thrown away and the
+    /// PID is integrating against the filter's last state instead.
+    #[test]
+    fn a_run_of_rejected_samples_stops_the_loop_that_both_sensor_checks_miss() {
+        let fresh = Some(Duration::ZERO);
+        assert_eq!(
+            loop_fault(true, REJECTS_BEFORE_FAULT - 1, fresh, fresh),
+            None
+        );
+        assert_eq!(
+            loop_fault(true, REJECTS_BEFORE_FAULT, fresh, fresh),
+            Some(LoopFault::SensorRejected)
+        );
+        // A dead controller is still the first thing to say.
+        assert_eq!(
+            loop_fault(false, REJECTS_BEFORE_FAULT, fresh, fresh),
+            Some(LoopFault::ControllerDown)
         );
     }
 

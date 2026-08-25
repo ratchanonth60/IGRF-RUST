@@ -216,7 +216,13 @@ struct IgrfApp {
     /// `None` until the second packet, where the step is unknown, not zero.
     last_filter_setpoint: Option<[f64; 3]>,
     sensor_intended: bool,
+    /// Whether the operator wants the controller link up. Drives the same
+    /// auto-reconnect the sensor gets: the firmware has no receive timeout, so
+    /// a dropped link leaves the coils energised at the last command until
+    /// something reopens the port.
+    controller_intended: bool,
     last_reconnect: Option<Instant>,
+    last_controller_reconnect: Option<Instant>,
     resume_after_reconnect: bool,
     paused_by_watchdog: [bool; 3],
     resume_pending: bool,
@@ -319,7 +325,9 @@ impl IgrfApp {
             last_sensor_raw: None,
             last_filter_setpoint: None,
             sensor_intended: false,
+            controller_intended: false,
             last_reconnect: None,
+            last_controller_reconnect: None,
             resume_after_reconnect: false,
             paused_by_watchdog: [false; 3],
             resume_pending: false,
@@ -499,6 +507,7 @@ impl IgrfApp {
         {
             Ok(()) => {
                 self.reset_controller_link_stats();
+                self.controller_intended = true;
                 self.set_status(format!(
                     "Controller connected: {} @ {baud}",
                     self.controller_port.trim()
@@ -514,6 +523,7 @@ impl IgrfApp {
         // and the integrators winding for the next connect.
         self.stop_all();
         self.controller_manager.disconnect();
+        self.controller_intended = false;
         self.set_status("Controller disconnected");
     }
 
@@ -560,6 +570,7 @@ impl IgrfApp {
     fn disconnect_magson(&mut self) {
         self.magson_client.disconnect();
         self.magson_receiver = None;
+        self.clear_magson();
         self.set_status("Magson disconnected");
     }
 
@@ -630,11 +641,51 @@ impl IgrfApp {
         }
     }
 
+    /// Reopens the controller port by itself, on the same terms as the sensor.
+    ///
+    /// More urgent than the sensor's: a sensor that is gone stops the loop and
+    /// nothing moves, but a controller that is gone leaves six coils holding
+    /// whatever they were last told, because the firmware never times out its
+    /// receive. Reopening the port is the only thing that can zero them.
+    fn maybe_reconnect_controller(&mut self) {
+        if !self.controller_intended || self.controller_manager.is_open() {
+            return;
+        }
+        if self
+            .last_controller_reconnect
+            .is_some_and(|last| last.elapsed() < RECONNECT_INTERVAL)
+        {
+            return;
+        }
+        self.last_controller_reconnect = Some(Instant::now());
+        let port = self.controller_port.trim().to_owned();
+        let Ok(baud) = parse_baud(&self.controller_baud) else {
+            return;
+        };
+        if self.controller_manager.connect(&port, baud).is_err() {
+            return;
+        }
+        self.reset_controller_link_stats();
+        // The link is back but the coils are still holding the last command the
+        // firmware got. Zero them before anything decides whether to resume.
+        if let Err(error) = self.zero_outputs() {
+            self.set_error(format!(
+                "Controller reopened but will not accept writes: {error}"
+            ));
+            return;
+        }
+        self.set_status(format!("Controller reconnected: {port}; outputs zeroed"));
+        if self.resume_after_reconnect {
+            self.resume_pending = true;
+        }
+    }
+
     fn poll_io(&mut self) {
         self.poll_lan_task();
         self.apply_filter_settings();
         self.apply_calibration();
         self.maybe_reconnect_sensor();
+        self.maybe_reconnect_controller();
         if self.sensor_manager.is_open() {
             let now = Instant::now();
             let should_handshake = self
@@ -673,6 +724,7 @@ impl IgrfApp {
         }
         if self.magson_receiver.is_some() && !self.magson_client.is_open() {
             self.magson_receiver = None;
+            self.clear_magson();
             self.set_error("Magson connection closed");
         }
     }
@@ -754,6 +806,17 @@ impl IgrfApp {
             .push(time, measured_magnitude);
     }
 
+    /// Drops the last Magson reading when the link goes away.
+    ///
+    /// The `Mag2*` CSV columns are written every tick from whatever is in
+    /// `self.magson`, so without this a dead link keeps publishing its final
+    /// sample for the rest of the run and nothing in the file distinguishes
+    /// that from a magnetometer reading a genuinely constant field.
+    fn clear_magson(&mut self) {
+        self.magson = [0.0; 3];
+        self.magson_total = 0.0;
+    }
+
     fn handle_magson_sample(&mut self, sample: MagsonSample) {
         self.magson = [sample.bx, sample.by, sample.bz];
         self.magson_total = self
@@ -779,12 +842,6 @@ impl IgrfApp {
     /// Time since any raw count last moved. `None` before the second packet.
     fn sensor_change_age(&self) -> Option<Duration> {
         Some(self.last_sensor_change?.elapsed())
-    }
-
-    /// A sensor still sending, but sending the same numbers for too long.
-    /// Held separate from staleness so the operator is told which one happened.
-    fn sensor_is_frozen(&self) -> bool {
-        sensor_is_frozen(self.sensor_change_age())
     }
 
     fn sensor_age(&self) -> Option<Duration> {
@@ -985,38 +1042,45 @@ impl IgrfApp {
             self.log_snapshot(elapsed);
             return;
         }
-        let frozen = self.sensor_is_frozen();
-        if self.pid_running.iter().any(|state| *state)
-            && (sensor_is_stale(self.sensor_age()) || frozen)
-        {
-            let reason = if frozen {
-                format!(
-                    "sensor readings unchanged for {:.1}s",
-                    self.sensor_change_age().unwrap_or_default().as_secs_f64()
-                )
-            } else {
-                match self.sensor_age() {
-                    Some(age) => format!("no sensor data for {:.1}s", age.as_secs_f64()),
-                    None => "no sensor data received yet".to_owned(),
-                }
-            };
-            self.paused_by_watchdog = self.pid_running;
-            self.watchdog_pause();
-            self.set_error(format!("PID paused: {reason}"));
-            // The rows around a fault are the ones worth having; the early
-            // return would drop exactly those from the CSV.
-            self.log_snapshot(elapsed);
-            return;
+        let fault = loop_fault(
+            self.controller_manager.is_open(),
+            self.sensor_age(),
+            self.sensor_change_age(),
+        );
+        if self.pid_running.iter().any(|state| *state) {
+            if let Some(fault) = fault {
+                let reason = match fault {
+                    LoopFault::ControllerDown => {
+                        "controller link down; the coils hold their last command until it reopens"
+                            .to_owned()
+                    }
+                    LoopFault::SensorFrozen => format!(
+                        "sensor readings unchanged for {:.1}s",
+                        self.sensor_change_age().unwrap_or_default().as_secs_f64()
+                    ),
+                    LoopFault::SensorStale => match self.sensor_age() {
+                        Some(age) => format!("no sensor data for {:.1}s", age.as_secs_f64()),
+                        None => "no sensor data received yet".to_owned(),
+                    },
+                };
+                self.paused_by_watchdog = self.pid_running;
+                self.watchdog_pause();
+                self.set_error(format!("PID paused: {reason}"));
+                // The rows around a fault are the ones worth having; the early
+                // return would drop exactly those from the CSV.
+                self.log_snapshot(elapsed);
+                return;
+            }
         }
 
-        // Stale data must not resume the loop: the reconnect only proves the
-        // port reopened, not that the sensor is talking again.
-        if self.resume_pending && !sensor_is_stale(self.sensor_age()) && !frozen {
+        // A reconnect only proves a port reopened, not that the link behind it
+        // works, so every fault has to be clear before the coils are driven.
+        if self.resume_pending && fault.is_none() {
             self.resume_pending = false;
             self.pid_running = self.paused_by_watchdog;
             self.paused_by_watchdog = [false; 3];
             if self.pid_running.iter().any(|state| *state) {
-                self.set_status("Sensor back; PID resumed");
+                self.set_status("Links back; PID resumed");
             }
         }
 
@@ -2375,6 +2439,39 @@ fn sensor_is_frozen(age: Option<Duration>) -> bool {
     age.is_some_and(|age| age > SENSOR_FROZEN_TIMEOUT)
 }
 
+/// Why the loop must not be driving the coils, if it must not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoopFault {
+    ControllerDown,
+    SensorFrozen,
+    SensorStale,
+}
+
+/// The one gate every path uses, so pausing and resuming cannot disagree about
+/// what counts as healthy.
+///
+/// Ordered by what the operator has to deal with first. A controller that is
+/// gone makes the sensor's state irrelevant - and is the worse fault, because
+/// the firmware has no receive timeout and holds its last command until the
+/// port reopens. A frozen sensor outranks a silent one only because it is the
+/// more specific diagnosis of the two.
+fn loop_fault(
+    controller_open: bool,
+    sensor_age: Option<Duration>,
+    sensor_change_age: Option<Duration>,
+) -> Option<LoopFault> {
+    if !controller_open {
+        return Some(LoopFault::ControllerDown);
+    }
+    if sensor_is_frozen(sensor_change_age) {
+        return Some(LoopFault::SensorFrozen);
+    }
+    if sensor_is_stale(sensor_age) {
+        return Some(LoopFault::SensorStale);
+    }
+    None
+}
+
 fn sensor_is_stale(age: Option<Duration>) -> bool {
     age.is_none_or(|age| age > SENSOR_TIMEOUT)
 }
@@ -2556,6 +2653,43 @@ mod tests {
         assert!(sensor_is_stale(Some(
             SENSOR_TIMEOUT + Duration::from_millis(1)
         )));
+    }
+
+    /// The gate the coils depend on. A healthy sensor must not excuse a
+    /// controller that is gone: the loop would keep integrating against a field
+    /// it can no longer move, and the coils would sit at their last command.
+    #[test]
+    fn a_missing_controller_stops_the_loop_even_with_a_perfect_sensor() {
+        let fresh = Some(Duration::ZERO);
+        assert_eq!(loop_fault(true, fresh, fresh), None);
+        assert_eq!(
+            loop_fault(false, fresh, fresh),
+            Some(LoopFault::ControllerDown)
+        );
+        // Never reported yet is not a controller fault, only a sensor one.
+        assert_eq!(loop_fault(true, None, None), Some(LoopFault::SensorStale));
+    }
+
+    /// Pause and resume read the same gate, so a fault cleared for one is
+    /// cleared for both - the bug being that they used to be separate boolean
+    /// chains that could drift apart.
+    #[test]
+    fn every_fault_outranks_a_healthy_reading_and_the_worst_one_is_reported() {
+        let stale = Some(SENSOR_TIMEOUT + Duration::from_secs(1));
+        let stuck = Some(SENSOR_FROZEN_TIMEOUT + Duration::from_secs(1));
+
+        assert_eq!(
+            loop_fault(false, stale, stuck),
+            Some(LoopFault::ControllerDown)
+        );
+        assert_eq!(
+            loop_fault(true, stale, stuck),
+            Some(LoopFault::SensorFrozen)
+        );
+        assert_eq!(
+            loop_fault(true, stale, Some(Duration::ZERO)),
+            Some(LoopFault::SensorStale)
+        );
     }
 
     #[test]

@@ -46,6 +46,23 @@ behaviour can be confirmed against a magnetometer rather than trusted from the
 disassembly. Run it with `--dry-run` first; it bypasses the PID and the
 app-side clamp.
 
+## Watchdogs
+
+The loop stops driving the coils on any of three faults, and the same gate
+decides when it may resume, so a pause and a resume cannot disagree:
+
+| Fault | Meaning |
+| --- | --- |
+| Controller link down | The serial port closed. Nothing reaches the coils, and the firmware has no receive timeout, so they hold their last command until the port reopens. |
+| Sensor frozen | Packets still arrive but the raw counts have not moved for 5 s. One HMR2300 count is 6.667 nT and its noise floor is larger, so three axes sitting exactly still is a dead sensor, not a quiet cage. |
+| Sensor stale | No packet for 5 s. |
+
+Both ports reopen by themselves every 10 s while the operator has them marked
+connected. A controller reconnect zeroes the outputs before anything else,
+because the coils were still energised the whole time it was gone. "Resume PID
+after auto-reconnect" decides whether the loop restarts itself; leave it off
+for anything attended.
+
 ## CSV columns
 
 The first 28 columns are the C# row, unchanged, so existing analysis scripts
@@ -90,6 +107,20 @@ rebuild.
 An ellipsoid fit produces a symmetric soft-iron matrix, so the app warns when
 one is not: at 50000 nT on one axis, an asymmetry of 0.045 leaks 2250 nT into
 another, which reads as a cage uniformity problem rather than a config typo.
+
+## Magson (second magnetometer)
+
+Display and logging only: the `Mag2*` CSV columns come from here, and nothing
+in the control loop reads them. The reading is cleared when the link drops, so
+a dead connection does not keep publishing its last sample.
+
+**The frame decode is not confirmed.** `parse_magson_frame` reads the three
+floats at offsets 48/52/56 of a 72-byte frame, which is what the C# build did,
+but logged values are not physical - three axes near 65000 with variances two
+orders of magnitude apart, and `Mag2X` sawtoothing like a counter. The frame
+specification would settle it. Until then the parser also cannot resynchronise:
+it consumes 72 bytes at a time with no framing, so a single lost byte silently
+ends the stream for the rest of the run. Both wait on the same document.
 
 ## Setpoint sources
 
@@ -141,8 +172,10 @@ line, then push to `main`.
 - `v0.x.0`: new features or configuration fields
 - `v1.0.0`: stable hardware/protocol contract
 
-`v0.4.0` feeds the commanded ramp to the Kalman filter as a control input,
-scales its process noise by the real sample interval, and replaces a spike
+`v0.4.0` stops the loop when the controller link drops - it previously kept
+integrating against a field it could no longer move - and reopens that port by
+itself the way the sensor port already did. It also feeds the commanded ramp to the Kalman filter as a control input, scales
+its process noise by the real sample interval, and replaces a spike
 threshold that could never fire (300000 nT, above the sensor's own 200000 nT
 full scale) with a configurable `SpikeNt`. Filtered field values during a ramp
 differ from `v0.3.0` by up to 11000 nT, because `v0.3.0` was lagging; steady

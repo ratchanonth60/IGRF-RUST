@@ -14,6 +14,7 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 egui_plot = "0.37.0"
 igrf-core = { path = "../igrf-core" }
 igrf-io = { path = "../igrf-io" }
+rfd = "0.17"
 serialport = "4.9"
 
 # Windowing backends are platform specific: asking for x11 on Windows fails to

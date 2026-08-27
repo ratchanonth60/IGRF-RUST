@@ -1,16 +1,19 @@
 mod calculation;
 mod config;
+mod contour;
 pub mod geomagnetism;
 mod kalman;
 mod map_grid;
 mod packet;
 mod pid;
+pub mod satellite;
 mod sensor;
 mod setpoint;
 
 pub use calculation::{
     CalculationError, CalculationService, ProcessedData, DEFAULT_SPIKE_THRESHOLD_NT, REJECTS_BEFORE_FAULT,
 };
+pub use contour::{contour_segments, ContourSegment};
 pub use config::{AppConfig, CalibrationSettings, FilterSettings, PidSettings};
 pub use kalman::KalmanFilter;
 pub use map_grid::MapGrid;

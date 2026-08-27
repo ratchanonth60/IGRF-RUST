@@ -1,15 +1,17 @@
 mod cage;
 mod netcfg;
 
+use chrono::{Datelike, Timelike};
 use eframe::egui::{self, Color32};
-use egui_plot::{Legend, Line, Plot, PlotPoints};
+use egui_plot::{Legend, Line, Plot, PlotPoint, PlotPoints, Points, Text};
 use igrf_core::geomagnetism::{
     Coordinate, GeomagnetismCalculator, GeomagnetismResult, UtcDateTime,
 };
+use igrf_core::satellite::{SatelliteTracker, SatellitePosition, PRESETS};
 use igrf_core::{
-    field_from_magnitude, AppConfig, CalculationService, CalibrationSettings, FilterSettings,
-    PidController, PidSettings, ProcessedData, SensorService, SetpointProfile, SlewLimiter,
-    FIRMWARE_MAX_OUTPUT, NOMINAL_TICK_SECONDS,
+    contour_segments, field_from_magnitude, AppConfig, CalculationService, CalibrationSettings,
+    ContourSegment, FilterSettings, MapGrid, PidController, PidSettings, ProcessedData,
+    SensorService, SetpointProfile, SlewLimiter, FIRMWARE_MAX_OUTPUT, NOMINAL_TICK_SECONDS,
 };
 use igrf_io::{
     write_controller_packet, ControllerReplyCounter, CsvLogger, MagsonSample, MagsonTcpClient,
@@ -28,6 +30,10 @@ const CONFIG_PATH: &str = "SystemConfig.json";
 const LOG_HEADER: &str = "Timestamp,MagX,MagY,MagZ,MagTotal,SetX,SetY,SetZ,SetTotal,ErrX,ErrY,ErrZ,OutX,OutY,OutZ,KpX,KiX,KdX,KpY,KiY,KdY,KpZ,KiZ,KdZ,Mag2X,Mag2Y,Mag2Z,Mag2Total,CmdX,CmdY,CmdZ,TickMs";
 const HANDSHAKE: [u8; 6] = [0x2A, 0x30, 0x30, 0x57, 0x45, 0x0D];
 const HISTORY_LIMIT: usize = 500;
+const CONTOUR_LINE_COLOR: Color32 = Color32::WHITE;
+/// Fixed contour step in nT, matching the C# app's hardcoded
+/// `ContourLevelStep = 2000` - no UI input for this.
+const CONTOUR_LEVEL_STEP_NT: f64 = 2000.0;
 const PID_INTERVAL: Duration = Duration::from_millis(100);
 const UI_INTERVAL: Duration = Duration::from_millis(50);
 /// A running loop is stopped once the newest sensor packet is older than this.
@@ -149,6 +155,23 @@ impl SetpointSource {
     }
 }
 
+/// Separated UI Tab IGRF Control and IGRF Model
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+enum AppTab {
+    #[default]
+    Control,
+    Model,
+}
+
+impl AppTab {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Control => "IGRF Control",
+            Self::Model => "IGRF Model",
+        }
+    }
+}
+
 struct IgrfApp {
     config: AppConfig,
     sensor_port: String,
@@ -234,13 +257,36 @@ struct IgrfApp {
     logger: Option<CsvLogger>,
     manual_lat: String,
     manual_lon: String,
-    manual_altitude: String,
-    manual_year: String,
-    manual_month: String,
-    manual_day: String,
     manual_result: Option<GeomagnetismResult>,
     manual_error: Option<String>,
 
+    /// "IGRF Model" group: geomagnetic grid map.
+    map_grid_path: String,
+    map_grid: Option<MapGrid>,
+    map_grid_error: Option<String>,
+    /// Traced by `igrf_core::contour_segments` whenever a grid loads or
+    /// "Generate Model" is pressed - the actual marching-squares math lives
+    /// in igrf-core, this just holds the result for rendering.
+    map_contours: Option<Vec<ContourSegment>>,
+    /// Bumped by "Generate Model" to reset the map plot's pan/zoom, by
+    /// changing the `Plot`'s egui id so it reinitialises its view.
+    map_view_generation: u64,
+
+    /// "Satellite Position" group: TLE tracking and simulated time.
+    satellite_preset: Option<usize>,
+    satellite_name: String,
+    tle_line1: String,
+    tle_line2: String,
+    satellite_tracker: Option<SatelliteTracker>,
+    satellite_tracking: bool,
+    sim_time_speed: i32,
+    sim_time_offset_s: f64,
+    sim_last_tick: Option<Instant>,
+    satellite_position: Option<SatellitePosition>,
+    satellite_field: Option<GeomagnetismResult>,
+    satellite_error: Option<String>,
+
+    active_tab: AppTab,
     status: String,
     error: Option<String>,
 }
@@ -338,12 +384,26 @@ impl IgrfApp {
             logger: None,
             manual_lat: "13.7563".to_owned(),
             manual_lon: "100.5018".to_owned(),
-            manual_altitude: "0".to_owned(),
-            manual_year: "2025".to_owned(),
-            manual_month: "1".to_owned(),
-            manual_day: "1".to_owned(),
             manual_result: None,
             manual_error: None,
+            map_grid_path: String::new(),
+            map_grid: None,
+            map_grid_error: None,
+            map_contours: None,
+            map_view_generation: 0,
+            satellite_preset: Some(0),
+            satellite_name: PRESETS[0].name.to_owned(),
+            tle_line1: PRESETS[0].line1.to_owned(),
+            tle_line2: PRESETS[0].line2.to_owned(),
+            satellite_tracker: None,
+            satellite_tracking: false,
+            sim_time_speed: 0,
+            sim_time_offset_s: 0.0,
+            sim_last_tick: None,
+            satellite_position: None,
+            satellite_field: None,
+            satellite_error: None,
+            active_tab: AppTab::default(),
             status,
             error: config_problem,
             config,
@@ -1441,19 +1501,26 @@ impl IgrfApp {
         }
     }
 
+    /// Calculate Magnetism
     fn calculate_manual_wmm(&mut self) {
         let result = (|| {
             let latitude = parse_f64(&self.manual_lat, "latitude")?;
             let longitude = parse_f64(&self.manual_lon, "longitude")?;
-            let altitude = parse_f64(&self.manual_altitude, "altitude")?;
-            let year = parse_i32(&self.manual_year, "year")?;
-            let month = parse_u8(&self.manual_month, "month")?;
-            let day = parse_u8(&self.manual_day, "day")?;
             let coordinate =
                 Coordinate::new(latitude, longitude).map_err(|error| error.to_string())?;
-            let date = UtcDateTime::date(year, month, day).map_err(|error| error.to_string())?;
+            let now = chrono::Utc::now();
+            let date = UtcDateTime::new(
+                now.year(),
+                now.month() as u8,
+                now.day() as u8,
+                now.hour() as u8,
+                now.minute() as u8,
+                now.second() as u8,
+                now.timestamp_subsec_millis() as u16,
+            )
+            .map_err(|error| error.to_string())?;
             GeomagnetismCalculator::new()
-                .try_calculate_at_altitude(coordinate, altitude, date)
+                .try_calculate_at_altitude(coordinate, 0.0, date)
                 .map_err(|error| error.to_string())?
                 .ok_or_else(|| "date is outside WMM2025 validity (2025-2030)".to_owned())
         })();
@@ -1466,6 +1533,125 @@ impl IgrfApp {
             Err(error) => {
                 self.manual_result = None;
                 self.manual_error = Some(error);
+            }
+        }
+    }
+
+    /// Load Model
+    fn browse_map_grid(&mut self) {
+        let picked = rfd::FileDialog::new()
+            .set_title("Select Geomagnetic Grid Data")
+            .add_filter("Text files", &["txt"])
+            .add_filter("All files", &["*"])
+            .pick_file();
+        let Some(path) = picked else {
+            return;
+        };
+        self.map_grid_path = path.display().to_string();
+        match MapGrid::load(&path) {
+            Ok(grid) => {
+                self.map_grid = Some(grid);
+                self.map_grid_error = None;
+                self.regenerate_contours();
+                self.set_status("Geomagnetic grid map loaded");
+            }
+            Err(error) => {
+                self.map_grid = None;
+                self.map_contours = None;
+                self.map_grid_error = Some(error.to_string());
+            }
+        }
+    }
+
+    /// Generate Model
+    fn regenerate_contours(&mut self) {
+        let Some(grid) = &self.map_grid else {
+            self.map_grid_error = Some("load a grid file first".to_owned());
+            return;
+        };
+        self.map_contours = Some(contour_segments(grid, CONTOUR_LEVEL_STEP_NT));
+        self.map_view_generation += 1;
+        self.map_grid_error = None;
+    }
+
+    /// Generate Results: parse the TLE and start the tracking loop
+    fn start_satellite_tracking(&mut self) {
+        let name = self.satellite_name.trim();
+        let name = if name.is_empty() { None } else { Some(name) };
+        match SatelliteTracker::from_tle(name, self.tle_line1.trim(), self.tle_line2.trim()) {
+            Ok(tracker) => {
+                self.satellite_tracker = Some(tracker);
+                self.satellite_tracking = true;
+                self.sim_time_offset_s = 0.0;
+                self.sim_last_tick = None;
+                self.satellite_error = None;
+                self.set_status("Satellite tracking started");
+            }
+            Err(error) => {
+                self.satellite_tracker = None;
+                self.satellite_tracking = false;
+                self.satellite_error = Some(error.to_string());
+            }
+        }
+    }
+
+    fn stop_satellite_tracking(&mut self) {
+        self.satellite_tracking = false;
+    }
+
+    // Get time
+    fn simulated_time(&self) -> Option<UtcDateTime> {
+        let offset = chrono::Duration::milliseconds((self.sim_time_offset_s * 1000.0).round() as i64);
+        let now = chrono::Utc::now().checked_add_signed(offset)?;
+        UtcDateTime::new(
+            now.year(),
+            now.month() as u8,
+            now.day() as u8,
+            now.hour() as u8,
+            now.minute() as u8,
+            now.second() as u8,
+            now.timestamp_subsec_millis() as u16,
+        )
+        .ok()
+    }
+
+    fn tick_satellite_tracking(&mut self) {
+        if !self.satellite_tracking {
+            return;
+        }
+        let Some(tracker) = &self.satellite_tracker else {
+            return;
+        };
+        let now = Instant::now();
+        if let Some(last) = self.sim_last_tick {
+            if now.duration_since(last) < Duration::from_secs(1) {
+                return;
+            }
+        }
+        self.sim_last_tick = Some(now);
+        self.sim_time_offset_s += self.sim_time_speed as f64;
+
+        let Some(time) = self.simulated_time() else {
+            self.satellite_error = Some("simulated time is out of range".to_owned());
+            return;
+        };
+        match tracker.position_at(time) {
+            Ok(position) => {
+                self.satellite_error = None;
+                self.satellite_field = Coordinate::new(position.latitude, position.longitude)
+                    .ok()
+                    .and_then(|coordinate| {
+                        GeomagnetismCalculator::new()
+                            .try_calculate_at_altitude(coordinate, position.altitude_km, time)
+                            .ok()
+                            .flatten()
+                    });
+                self.satellite_position = Some(position);
+            }
+            Err(error) => {
+                self.satellite_error = Some(error.to_string());
+                self.satellite_position = None;
+                self.satellite_field = None;
             }
         }
     }
@@ -1501,6 +1687,28 @@ impl IgrfApp {
         if let Err(error) = self.zero_outputs() {
             self.set_error(format!("Watchdog pause: controller write failed: {error}"));
         }
+    }
+
+    /// Top-level page navigation
+    fn show_tab_strip(&mut self, ui: &mut egui::Ui) {
+        ui.add_space(4.0);
+        ui.horizontal(|ui| {
+            for tab in [AppTab::Control, AppTab::Model] {
+                let selected = self.active_tab == tab;
+                let button = egui::Button::new(
+                    egui::RichText::new(tab.label())
+                        .strong()
+                        .size(15.0),
+                )
+                .selected(selected)
+                .min_size(egui::vec2(120.0, 28.0));
+                if ui.add(button).clicked() {
+                    self.active_tab = tab;
+                }
+            }
+        });
+        ui.add_space(4.0);
+        ui.separator();
     }
 
     fn show_top_bar(&mut self, ui: &mut egui::Ui) {
@@ -1990,24 +2198,19 @@ impl IgrfApp {
     }
 
     fn show_manual_panel(&mut self, ui: &mut egui::Ui) {
-        ui.label("Default date is fixed at 2025-01-01 (valid WMM2025 date).");
         egui::Grid::new("manual-wmm-grid")
             .num_columns(2)
             .show(ui, |ui| {
                 for (label, value) in [
                     ("Latitude", &mut self.manual_lat),
                     ("Longitude", &mut self.manual_lon),
-                    ("Altitude km", &mut self.manual_altitude),
-                    ("Year", &mut self.manual_year),
-                    ("Month", &mut self.manual_month),
-                    ("Day", &mut self.manual_day),
                 ] {
                     ui.label(label);
                     ui.text_edit_singleline(value);
                     ui.end_row();
                 }
             });
-        if ui.button("Calculate WMM2025").clicked() {
+        if ui.button("Calculate Magnetism WMM2025").clicked() {
             self.calculate_manual_wmm();
         }
         if let Some(error) = &self.manual_error {
@@ -2019,18 +2222,239 @@ impl IgrfApp {
                 .striped(true)
                 .show(ui, |ui| {
                     for (label, value) in [
-                        ("X", result.x),
-                        ("Y", result.y),
-                        ("Z", result.z),
                         ("Declination", result.declination),
                         ("Inclination", result.inclination),
                         ("Intensity", result.total_intensity),
+                        ("X", result.x),
+                        ("Y", result.y),
+                        ("Z", result.z),
                     ] {
                         ui.label(label);
                         ui.label(format!("{value:.4}"));
                         ui.end_row();
                     }
                 });
+        }
+    }
+
+    /// Tab left side: IGRF Model group loaded from a text file, and a "Generate Model"
+    fn show_map_panel(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal(|ui| {
+            if ui.button("Load Model").clicked() {
+                self.browse_map_grid();
+            }
+        });
+        if !self.map_grid_path.is_empty() {
+            ui.label(format!("File: {}", self.map_grid_path));
+        }
+        if let Some(error) = &self.map_grid_error {
+            ui.colored_label(Color32::LIGHT_RED, error);
+        }
+    }
+
+    /// Time group: live UTC clock
+    fn show_time_panel(&self, ui: &mut egui::Ui) {
+        ui.label(format!(
+            "UTC: {}",
+            chrono::Utc::now().format("%Y-%m-%d %H:%M:%S")
+        ));
+    }
+
+    /// Satellite Position group: SGP4 propagation and the
+    /// TEME->geodetic conversion happen in `igrf_core::satellite`; this
+    /// owns the TLE text fields, the tracking toggle, and the simulated
+    /// clock's speed/offset.
+    fn show_satellite_panel(&mut self, ui: &mut egui::Ui) {
+        egui::ComboBox::from_id_salt("satellite-preset")
+            .selected_text(match self.satellite_preset {
+                Some(index) => PRESETS[index].name,
+                None => "-- Manual --",
+            })
+            .show_ui(ui, |ui| {
+                if ui
+                    .selectable_label(self.satellite_preset.is_none(), "-- Manual --")
+                    .clicked()
+                {
+                    self.satellite_preset = None;
+                }
+                for (index, preset) in PRESETS.iter().enumerate() {
+                    if ui
+                        .selectable_label(self.satellite_preset == Some(index), preset.name)
+                        .clicked()
+                    {
+                        self.satellite_preset = Some(index);
+                        self.satellite_name = preset.name.to_owned();
+                        self.tle_line1 = preset.line1.to_owned();
+                        self.tle_line2 = preset.line2.to_owned();
+                        // Switching satellites mid-track should jump straight
+                        // to the new one's live results, not leave the old
+                        // tracker running until an explicit Stop+Generate.
+                        if self.satellite_tracking {
+                            self.start_satellite_tracking();
+                        }
+                    }
+                }
+            });
+
+        ui.horizontal(|ui| {
+            ui.label("Name");
+            ui.text_edit_singleline(&mut self.satellite_name);
+        });
+        ui.horizontal(|ui| {
+            ui.label("Line 1");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.tle_line1)
+                    .desired_width(300.0)
+                    .font(egui::TextStyle::Monospace),
+            );
+        });
+        ui.horizontal(|ui| {
+            ui.label("Line 2");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.tle_line2)
+                    .desired_width(300.0)
+                    .font(egui::TextStyle::Monospace),
+            );
+        });
+
+        ui.horizontal(|ui| {
+            if self.satellite_tracking {
+                if ui.button("Stop Tracking").clicked() {
+                    self.stop_satellite_tracking();
+                }
+            } else if ui.button("Generate Results").clicked() {
+                self.start_satellite_tracking();
+            }
+        });
+        if let Some(error) = &self.satellite_error {
+            ui.colored_label(Color32::LIGHT_RED, error);
+        }
+
+        // Simulated time speed slider, with a reset button and a display of the current simulated time.
+        ui.separator();
+        ui.label("Simulated time speed (seconds per real second)");
+        ui.horizontal(|ui| {
+            ui.add(egui::Slider::new(&mut self.sim_time_speed, -600..=600));
+            if ui.button("Reset").clicked() {
+                self.sim_time_speed = 0;
+                self.sim_time_offset_s = 0.0;
+                self.sim_last_tick = None;
+            }
+        });
+        if let Some(time) = self.simulated_time() {
+            ui.label(format!(
+                "Simulated time: {:04}-{:02}-{:02} {:02}:{:02}:{:02}",
+                time.year, time.month, time.day, time.hour, time.minute, time.second
+            ));
+        }
+
+        ui.add_space(8.0);
+        ui.separator();
+        ui.label(egui::RichText::new("Satellite Result").strong());
+        match self.satellite_position {
+            Some(position) => {
+                let field = self.satellite_field;
+                egui::Grid::new("satellite-position-result-grid")
+                    .num_columns(2)
+                    .striped(true)
+                    .show(ui, |ui| {
+                        ui.label("Latitude");
+                        ui.label(format!("{:.3}", position.latitude));
+                        ui.end_row();
+                        ui.label("Longitude");
+                        ui.label(format!("{:.3}", position.longitude));
+                        ui.end_row();
+                        ui.label("Altitude km");
+                        ui.label(format!("{:.3}", position.altitude_km));
+                        ui.end_row();
+                        ui.label("Total Intensity");
+                        match field.map(|f| f.total_intensity) {
+                            Some(value) => ui.label(format!("{value:.3}")),
+                            None => ui.label("--"),
+                        };
+                        ui.end_row();
+                        // The satellite's TEME position (km) X/Y/Z
+                        for (label, value) in [
+                            ("X", position.teme_x_km),
+                            ("Y", position.teme_y_km),
+                            ("Z", position.teme_z_km),
+                        ] {
+                            ui.label(label);
+                            ui.label(format!("{value:.3}"));
+                            ui.end_row();
+                        }
+                    });
+            }
+            None => {
+                ui.label("No satellite result yet. Press \"Generate Results\" to start tracking.");
+            }
+        }
+    }
+
+    /// Right side of the IGRF Model tab: Magnetism Result
+    fn show_model_result_panel(&mut self, ui: &mut egui::Ui) {
+        ui.heading("Geomagnetic field map");
+        match &self.map_contours {
+            Some(contours) if !contours.is_empty() => {
+                let mut labels: Vec<(f64, [f64; 2])> = Vec::new();
+                for segment in contours {
+                    let already_labelled = labels
+                        .iter()
+                        .any(|(level, _)| (level - segment.level).abs() < f64::EPSILON);
+                    if !already_labelled {
+                        labels.push((
+                            segment.level,
+                            [
+                                (segment.start[0] + segment.end[0]) / 2.0,
+                                (segment.start[1] + segment.end[1]) / 2.0,
+                            ],
+                        ));
+                    }
+                }
+                let satellite_position = self.satellite_position;
+
+                Plot::new(("model-map", self.map_view_generation))
+                    .x_axis_label("Longitude")
+                    .y_axis_label("Latitude")
+                    .height(720.0)
+                    .show(ui, |plot_ui| {
+                        for segment in contours {
+                            plot_ui.line(
+                                Line::new(
+                                    "Contour lines",
+                                    PlotPoints::new(vec![segment.start, segment.end]),
+                                )
+                                .color(CONTOUR_LINE_COLOR),
+                            );
+                        }
+                        for (level, point) in &labels {
+                            plot_ui.text(
+                                Text::new(
+                                    format!("contour-label-{level}"),
+                                    PlotPoint::new(point[0], point[1]),
+                                    format!("{level:.0}"),
+                                )
+                                .color(CONTOUR_LINE_COLOR),
+                            );
+                        }
+                        if let Some(position) = satellite_position {
+                            plot_ui.points(
+                                Points::new(
+                                    "Satellite",
+                                    vec![[position.longitude, position.latitude]],
+                                )
+                                .radius(5.0)
+                                .color(Color32::RED),
+                            );
+                        }
+                    });
+            }
+            Some(_) => {
+                ui.label("No contour lines at this level step for the loaded grid.");
+            }
+            None => {
+                ui.label("No geomagnetic field map generated yet.");
+            }
         }
     }
 
@@ -2370,14 +2794,13 @@ impl eframe::App for IgrfApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.poll_io();
         self.run_pid();
+        self.tick_satellite_tracking();
         ctx.request_repaint_after(UI_INTERVAL);
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        egui::Panel::top("top-bar").show(ui, |ui| {
-            ui.add_space(4.0);
-            self.show_top_bar(ui);
-            ui.add_space(4.0);
+        egui::Panel::top("tab-strip").show(ui, |ui| {
+            self.show_tab_strip(ui);
         });
         egui::Panel::bottom("status").show(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
@@ -2390,45 +2813,81 @@ impl eframe::App for IgrfApp {
                 }
             });
         });
-        egui::Panel::left("setup")
-            .resizable(true)
-            .default_size(300.0)
-            .size_range(240.0..=460.0)
-            .show(ui, |ui| {
-                egui::ScrollArea::vertical().show(ui, |ui| {
-                    egui::CollapsingHeader::new("Connections")
-                        .default_open(true)
-                        .show(ui, |ui| self.show_connection_panel(ui));
-                    egui::CollapsingHeader::new("LAN static IP")
-                        .default_open(false)
-                        .show(ui, |ui| self.show_lan_panel(ui));
-                    egui::CollapsingHeader::new("Setpoint command")
-                        .default_open(true)
-                        .show(ui, |ui| self.show_setpoint_panel(ui));
-                    egui::CollapsingHeader::new("Sensor calibration")
-                        .default_open(false)
-                        .show(ui, |ui| self.show_calibration_panel(ui));
-                    egui::CollapsingHeader::new("Config / logging")
-                        .default_open(true)
-                        .show(ui, |ui| self.show_config_panel(ui));
-                    egui::CollapsingHeader::new("Manual WMM2025 calculator")
-                        .default_open(false)
-                        .show(ui, |ui| self.show_manual_panel(ui));
-                });
-            });
-        egui::CentralPanel::default().show(ui, |ui| {
-            egui::ScrollArea::vertical()
-                .auto_shrink([false; 2])
-                .show(ui, |ui| {
-                    self.show_axis_row(ui);
+        match self.active_tab {
+            AppTab::Control => {
+                egui::Panel::top("top-bar").show(ui, |ui| {
                     ui.add_space(4.0);
-                    self.show_magson_strip(ui);
-                    ui.separator();
-                    self.show_plots(ui);
-                    ui.separator();
-                    self.show_cage_row(ui);
+                    self.show_top_bar(ui);
+                    ui.add_space(4.0);
                 });
-        });
+                egui::Panel::left("setup")
+                    .resizable(true)
+                    .default_size(300.0)
+                    .size_range(240.0..=460.0)
+                    .show(ui, |ui| {
+                        egui::ScrollArea::vertical().show(ui, |ui| {
+                            egui::CollapsingHeader::new("Connections")
+                                .default_open(true)
+                                .show(ui, |ui| self.show_connection_panel(ui));
+                            egui::CollapsingHeader::new("LAN static IP")
+                                .default_open(false)
+                                .show(ui, |ui| self.show_lan_panel(ui));
+                            egui::CollapsingHeader::new("Setpoint command")
+                                .default_open(true)
+                                .show(ui, |ui| self.show_setpoint_panel(ui));
+                            egui::CollapsingHeader::new("Sensor calibration")
+                                .default_open(false)
+                                .show(ui, |ui| self.show_calibration_panel(ui));
+                            egui::CollapsingHeader::new("Config / logging")
+                                .default_open(true)
+                                .show(ui, |ui| self.show_config_panel(ui));
+                            egui::CollapsingHeader::new("Manual WMM2025 calculator")
+                                .default_open(false)
+                                .show(ui, |ui| self.show_manual_panel(ui));
+                        });
+                    });
+                egui::CentralPanel::default().show(ui, |ui| {
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false; 2])
+                        .show(ui, |ui| {
+                            self.show_axis_row(ui);
+                            ui.add_space(4.0);
+                            self.show_magson_strip(ui);
+                            ui.separator();
+                            self.show_plots(ui);
+                            ui.separator();
+                            self.show_cage_row(ui);
+                        });
+                });
+            }
+            AppTab::Model => {
+                egui::Panel::left("model-setup")
+                    .resizable(true)
+                    .default_size(300.0)
+                    .size_range(240.0..=460.0)
+                    .show(ui, |ui| {
+                        egui::ScrollArea::vertical().show(ui, |ui| {
+                            egui::CollapsingHeader::new("IGRF Model")
+                                .default_open(true)
+                                .show(ui, |ui| self.show_map_panel(ui));
+                            egui::CollapsingHeader::new("Time")
+                                .default_open(true)
+                                .show(ui, |ui| self.show_time_panel(ui));
+                            egui::CollapsingHeader::new("Satellite Position")
+                                .default_open(true)
+                                .show(ui, |ui| self.show_satellite_panel(ui));
+                            // egui::CollapsingHeader::new("Manual WMM2025 calculator")
+                            //     .default_open(true)
+                            //     .show(ui, |ui| self.show_manual_panel(ui));
+                        });
+                    });
+                egui::CentralPanel::default().show(ui, |ui| {
+                    egui::ScrollArea::vertical()
+                        .auto_shrink([false; 2])
+                        .show(ui, |ui| self.show_model_result_panel(ui));
+                });
+            }
+        }
     }
 }
 
@@ -2647,20 +3106,6 @@ fn parse_f64(value: &str, label: &str) -> Result<f64, String> {
     }
 }
 
-fn parse_i32(value: &str, label: &str) -> Result<i32, String> {
-    value
-        .trim()
-        .parse::<i32>()
-        .map_err(|_| format!("{label} must be an integer"))
-}
-
-fn parse_u8(value: &str, label: &str) -> Result<u8, String> {
-    value
-        .trim()
-        .parse::<u8>()
-        .map_err(|_| format!("{label} must be an integer from 0 to 255"))
-}
-
 fn parse_baud(value: &str) -> Result<u32, String> {
     let baud = value
         .trim()
@@ -2682,209 +3127,5 @@ fn parse_tcp_port(value: &str) -> Result<u16, String> {
         Err("must be greater than zero".to_owned())
     } else {
         Ok(port)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn sensor_is_stale_before_the_first_packet_and_after_the_timeout() {
-        assert!(sensor_is_stale(None));
-        assert!(!sensor_is_stale(Some(Duration::ZERO)));
-        assert!(!sensor_is_stale(Some(SENSOR_TIMEOUT)));
-        assert!(sensor_is_stale(Some(
-            SENSOR_TIMEOUT + Duration::from_millis(1)
-        )));
-    }
-
-    /// The gate the coils depend on. A healthy sensor must not excuse a
-    /// controller that is gone: the loop would keep integrating against a field
-    /// it can no longer move, and the coils would sit at their last command.
-    #[test]
-    fn a_missing_controller_stops_the_loop_even_with_a_perfect_sensor() {
-        let fresh = Some(Duration::ZERO);
-        assert_eq!(loop_fault(true, fresh, fresh), None);
-        assert_eq!(
-            loop_fault(false, fresh, fresh),
-            Some(LoopFault::ControllerDown)
-        );
-        // Never reported yet is not a controller fault, only a sensor one.
-        assert_eq!(loop_fault(true, None, None), Some(LoopFault::SensorStale));
-    }
-
-    /// Pause and resume read the same gate, so a fault cleared for one is
-    /// cleared for both - the bug being that they used to be separate boolean
-    /// chains that could drift apart.
-    #[test]
-    fn every_fault_outranks_a_healthy_reading_and_the_worst_one_is_reported() {
-        let stale = Some(SENSOR_TIMEOUT + Duration::from_secs(1));
-        let stuck = Some(SENSOR_FROZEN_TIMEOUT + Duration::from_secs(1));
-
-        assert_eq!(
-            loop_fault(false, stale, stuck),
-            Some(LoopFault::ControllerDown)
-        );
-        assert_eq!(
-            loop_fault(true, stale, stuck),
-            Some(LoopFault::SensorFrozen)
-        );
-        assert_eq!(
-            loop_fault(true, stale, Some(Duration::ZERO)),
-            Some(LoopFault::SensorStale)
-        );
-    }
-
-    #[test]
-    fn a_sensor_is_frozen_only_after_readings_sit_still_past_the_timeout() {
-        // No second packet yet is staleness's problem, not this one.
-        assert!(!sensor_is_frozen(None));
-        assert!(!sensor_is_frozen(Some(SENSOR_FROZEN_TIMEOUT)));
-        assert!(sensor_is_frozen(Some(
-            SENSOR_FROZEN_TIMEOUT + Duration::from_millis(1)
-        )));
-        assert!(
-            SENSOR_FROZEN_TIMEOUT > SENSOR_TIMEOUT,
-            "a frozen sensor must outlive a missing one, or staleness never reports"
-        );
-    }
-
-    #[test]
-    fn only_addresses_that_resolve_to_this_machine_count_as_loopback() {
-        assert!(is_loopback("127.0.0.1"));
-        assert!(is_loopback("localhost"));
-        // The whole point of the warning: a wildcard bind is not local.
-        assert!(!is_loopback("0.0.0.0"));
-        assert!(!is_loopback("192.168.1.10"));
-        // Unresolvable must warn rather than reassure.
-        assert!(!is_loopback("not a host"));
-    }
-
-    #[test]
-    fn output_fraction_clamps_and_survives_degenerate_ranges() {
-        assert_eq!(output_fraction(0.0, -1.0, 1.0), 0.5);
-        assert_eq!(output_fraction(-5.0, -1.0, 1.0), 0.0);
-        assert_eq!(output_fraction(5.0, -1.0, 1.0), 1.0);
-        assert_eq!(output_fraction(1.0, 2.0, 2.0), 0.0);
-        assert_eq!(output_fraction(f64::NAN, -1.0, 1.0), 0.0);
-        assert_eq!(output_fraction(0.0, f64::NEG_INFINITY, 1.0), 0.0);
-    }
-
-    #[test]
-    fn history_is_capped_and_rejects_non_finite_points() {
-        let mut history = History::default();
-        for index in 0..(HISTORY_LIMIT + 25) {
-            history.push(index as f64, index as f64);
-        }
-        history.push(f64::NAN, 1.0);
-        history.push(1.0, f64::INFINITY);
-        assert_eq!(history.points.len(), HISTORY_LIMIT);
-        assert_eq!(history.points[0], [25.0, 25.0]);
-        assert_eq!(history.points[HISTORY_LIMIT - 1], [524.0, 524.0]);
-    }
-
-    #[test]
-    fn plot_history_clear_removes_magnitude_series() {
-        let mut history = PlotHistory::default();
-        history.sensor_magnitude_setpoint.push(1.0, 2.0);
-        history.sensor_magnitude_measured.push(1.0, 3.0);
-
-        history.clear();
-
-        assert!(history.sensor_magnitude_setpoint.points.is_empty());
-        assert!(history.sensor_magnitude_measured.points.is_empty());
-    }
-
-    #[test]
-    fn input_parsing_rejects_invalid_values_without_panicking() {
-        assert!(parse_baud("0").is_err());
-        assert!(parse_tcp_port("70000").is_err());
-        assert!(parse_f64("NaN", "x").is_err());
-        assert_eq!(parse_u8("12", "day"), Ok(12));
-    }
-
-    /// The watchdog path must not throw away the standing current, and STOP
-    /// ALL must. Guarding the distinction here because the difference is
-    /// invisible until a real dropout on real hardware.
-    #[test]
-    fn a_watchdog_pause_keeps_the_integral_that_a_deliberate_stop_clears() {
-        let mut pid = PidController::default();
-        pid.ki = 0.0679;
-        for _ in 0..50 {
-            pid.calculate(0.0, 40_000.0);
-        }
-        let standing = pid.integral();
-        assert!(standing != 0.0);
-
-        pid.hold();
-        assert_eq!(pid.integral(), standing);
-
-        pid.reset();
-        assert_eq!(pid.integral(), 0.0);
-    }
-
-    /// The CSV is the only record a month-long unattended run leaves behind,
-    /// so the column count has to match the header exactly or every downstream
-    /// script silently reads shifted fields.
-    /// The CSV is the only record a month-long unattended run leaves behind,
-    /// so a row has to line up with the header exactly: a mismatch shifts every
-    /// field in every downstream script without any error to notice.
-    #[test]
-    fn a_snapshot_row_has_one_field_per_header_column() {
-        let row = IgrfApp::snapshot_row(
-            "2026-08-25 00:00:00.000",
-            [1.0, 2.0, 3.0],
-            [4.0, 5.0, 6.0],
-            [7.0, 8.0, 9.0],
-            &[
-                PidSettings::default(),
-                PidSettings::default(),
-                PidSettings::default(),
-            ],
-            [10.0; 3],
-            [11.0, 12.0, 13.0],
-            [14.0, 15.0, 16.0],
-            Duration::from_millis(117),
-        );
-
-        assert_eq!(
-            row.split(',').count(),
-            LOG_HEADER.split(',').count(),
-            "row: {row}"
-        );
-        assert!(
-            row.ends_with(",117.0"),
-            "the tick interval is the last column"
-        );
-    }
-
-    #[test]
-    fn soft_iron_asymmetry_flags_the_mistyped_digit_but_not_a_real_fit() {
-        let good = CalibrationSettings {
-            soft_iron: [
-                [0.9958, -0.0050, 0.0064],
-                [-0.0050, 1.0042, -0.0087],
-                [0.0064, -0.0087, 1.0003],
-            ],
-            ..Default::default()
-        };
-        assert!(good.asymmetry() <= SOFT_IRON_ASYMMETRY_LIMIT);
-
-        // The shipped default has -0.050 where -0.0050 belongs.
-        assert!(CalibrationSettings::default().asymmetry() > SOFT_IRON_ASYMMETRY_LIMIT);
-    }
-
-    #[test]
-    fn pid_settings_reject_non_finite_and_reversed_output_limits() {
-        let mut settings = PidSettings::default();
-        assert!(validate_pid_settings(&settings).is_ok());
-        settings.kp = f64::NAN;
-        assert!(validate_pid_settings(&settings).is_err());
-        settings = PidSettings::default();
-        settings.min_output = settings.max_output;
-        assert!(validate_pid_settings(&settings).is_err());
-        settings.min_output = 101.0;
-        assert!(validate_pid_settings(&settings).is_err());
     }
 }

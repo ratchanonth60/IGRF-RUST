@@ -188,11 +188,29 @@ cargo build --release --package igrf-app
 
 The release binary is `target/release/igrf-app`.
 
+### Compile-checking the Raspberry Pi (aarch64) build locally
+
+```bash
+cargo install cross --locked
+docker build -t igrf-cross-aarch64:local -f docker/cross-aarch64-unknown-linux-gnu.Dockerfile .
+cross build --release --target aarch64-unknown-linux-gnu --package igrf-app
+```
+
+This is a compile/link check only, not a deployable artifact: the image is
+Ubuntu 24.04-based and the resulting binary links `GLIBC_2.39`, which
+Raspberry Pi OS Bookworm (glibc 2.36) refuses to run. The actual Pi binary
+comes from the `ubuntu-22.04-arm` job in `release.yml`, which compiles
+natively on real arm64 hardware - see the Dockerfile's header comment for
+why matching the Pi's glibc in this local image isn't practical.
+
 ## Automatic GitHub releases
 
-Every push to `main` runs the checks and creates a GitHub Release containing
-the Linux binary and its SHA-256 file. Tags use
-`v<igrf-app-version>-main.<run-id>`; for example, `v0.1.0-main.123456789`.
+Every push to `master` runs the checks and creates a GitHub Release containing
+two Linux binaries (`x86_64` and `aarch64`, each with its SHA-256 file). The
+`aarch64` build runs natively on a GitHub-hosted arm64 runner - no cross
+toolchain - and targets 64-bit Raspberry Pi OS (Bookworm or newer; Pi 5
+doesn't support the 32-bit or Bullseye images). Tags use
+`v<igrf-app-version>-master.<run-id>`; for example, `v0.1.0-master.123456789`.
 
 Change the version in `igrf-app/Cargo.toml` when you want the next release
 line, then push to `main`.

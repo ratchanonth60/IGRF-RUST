@@ -11,8 +11,20 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  release:
-    runs-on: ubuntu-latest
+  build:
+    strategy:
+      matrix:
+        include:
+          # Pi 5 runs 64-bit Raspberry Pi OS (Bookworm, glibc 2.36). The
+          # GitHub-hosted arm64 runner builds natively - no cross toolchain,
+          # no QEMU - so this only needs the same apt packages as the
+          # x86_64 leg, just resolved for arm64.
+          - arch: x86_64
+            runs-on: ubuntu-latest
+          - arch: aarch64
+            runs-on: ubuntu-22.04-arm
+
+    runs-on: ${{ matrix.runs-on }}
 
     steps:
       - name: Checkout
@@ -47,24 +59,50 @@ jobs:
         shell: bash
         run: |
           version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "igrf-app") | .version')"
-          tag="v${version}-master.${GITHUB_RUN_ID}"
-          package="igrf-app-${version}-linux-x86_64.tar.gz"
+          package="igrf-app-${version}-linux-${{ matrix.arch }}.tar.gz"
 
           mkdir -p dist/package
           cp target/release/igrf-app SystemConfig.example.json dist/package/
           tar -C dist/package -czf "dist/${package}" igrf-app SystemConfig.example.json
           sha256sum "dist/${package}" > "dist/${package}.sha256"
 
-          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
           echo "package=${package}" >> "$GITHUB_OUTPUT"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: package-${{ matrix.arch }}
+          path: |
+            dist/${{ steps.package.outputs.package }}
+            dist/${{ steps.package.outputs.package }}.sha256
+          retention-days: 1
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: package-*
+          merge-multiple: true
 
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "${{ steps.package.outputs.tag }}" \
+          # No Rust toolchain in this job - version comes straight out of
+          # Cargo.toml instead of `cargo metadata`, since the build matrix
+          # already did the real work.
+          version="$(grep -m1 '^version' igrf-app/Cargo.toml | sed -E 's/version *= *"([^"]+)"/\1/')"
+          tag="v${version}-master.${GITHUB_RUN_ID}"
+          gh release create "${tag}" \
             --target "$GITHUB_SHA" \
-            --title "IGRF ${{ steps.package.outputs.tag }}" \
+            --title "IGRF ${tag}" \
             --generate-notes \
-            "dist/${{ steps.package.outputs.package }}" \
-            "dist/${{ steps.package.outputs.package }}.sha256"
+            dist/*

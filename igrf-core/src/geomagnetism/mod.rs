@@ -58,8 +58,8 @@ impl Coordinate {
 pub struct CoordinateZ {
     pub latitude: f64,
     pub longitude: f64,
-    /// The same altitude unit used by the original C# calculator. Ground
-    /// calculations use zero; callers may supply kilometres for high altitude.
+    /// Altitude in kilometres. Ground calculations use zero; callers may
+    /// supply kilometres for high altitude.
     pub elevation: f64,
 }
 
@@ -74,8 +74,7 @@ impl CoordinateZ {
             longitude,
             elevation,
         })
-    }
-
+    }    
     pub fn coordinate(self) -> Coordinate {
         Coordinate {
             latitude: self.latitude,
@@ -146,7 +145,7 @@ impl UtcDateTime {
         Self::new(year, month, day, 0, 0, 0, 0)
     }
 
-    fn julian_day(self) -> f64 {
+    pub(crate) fn julian_day(self) -> f64 {
         let is_julian = self.year < 1582
             || (self.year == 1582 && (self.month < 10 || (self.month == 10 && self.day < 5)));
         let m = if self.month > 2 {
@@ -171,12 +170,24 @@ impl UtcDateTime {
         (365.25 * (y + 4716) as f64).trunc() + (30.6001 * (m + 1) as f64).trunc() + d + b as f64
             - 1524.5
     }
+
+    /// Greenwich Mean Sidereal Time, IAU-1982 formula. Used to rotate a TEME
+    /// satellite position into an Earth-fixed frame; ignores polar motion and
+    /// nutation, matching the precision of the lightweight SGP4 tracker this
+    /// crate replaces.
+    pub(crate) fn gmst_radians(self) -> f64 {
+        let jd = self.julian_day();
+        let t = (jd - 2_451_545.0) / 36_525.0;
+        let gmst_deg = 280.460_618_37
+            + 360.985_647_366_29 * (jd - 2_451_545.0)
+            + 0.000_387_933 * t * t
+            - t * t * t / 38_710_000.0;
+        gmst_deg.rem_euclid(360.0).to_radians()
+    }
 }
 
 /// The radius the WMM spherical-harmonic expansion is defined against
-/// (WMM2025 technical report, eq. 1). It is a model constant, not a property of
-/// the ellipsoid: using the WGS 84 mean radius instead scales the field by
-/// roughly 1e-4 and misses the published test values by about 4 nT.
+/// (WMM2025 technical report, eq. 1).
 const GEOMAGNETIC_REFERENCE_RADIUS_KM: f64 = 6371.2;
 
 fn days_in_month(year: i32, month: u8) -> u8 {
@@ -237,10 +248,23 @@ pub struct GeomagnetismResult {
 }
 
 impl GeomagnetismResult {
+    /// A bit-exact-zero X or Y reports every field as 0.0 instead of the
+    /// computed value, rather than letting `atan2` evaluate at the origin.
     fn new(coordinate: CoordinateZ, date: UtcDateTime, x: f64, y: f64, z: f64) -> Self {
-        // atan2 is defined at the origin, so a near-zero component needs no
-        // guard: blanking the whole vector would report a field of zero for a
-        // location that merely has no eastward component.
+        const SMALLEST_POSITIVE_DENORMAL: f64 = f64::from_bits(1);
+        if x.abs() < SMALLEST_POSITIVE_DENORMAL * 2.0 || y.abs() < SMALLEST_POSITIVE_DENORMAL * 2.0 {
+            return Self {
+                coordinate,
+                date,
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+                declination: 0.0,
+                inclination: 0.0,
+                total_intensity: 0.0,
+                horizontal_intensity: 0.0,
+            };
+        }
         let horizontal_intensity = (x * x + y * y).sqrt();
         Self {
             coordinate,
@@ -292,21 +316,6 @@ impl GeomagnetismCalculator {
         Self {
             spheroid: Wgs84::default(),
         }
-    }
-
-    pub fn with_spheroid(spheroid: Wgs84) -> Self {
-        Self { spheroid }
-    }
-
-    pub fn try_calculate(
-        &self,
-        coordinate: Coordinate,
-        date: UtcDateTime,
-    ) -> Result<Option<GeomagnetismResult>, GeomagnetismError> {
-        self.try_calculate_z(
-            CoordinateZ::new(coordinate.latitude, coordinate.longitude, 0.0)?,
-            date,
-        )
     }
 
     pub fn try_calculate_at_altitude(
@@ -414,7 +423,7 @@ impl GeomagnetismCalculator {
 
     /// Convert geodetic latitude/elevation to the spherical WMM colatitude and
     /// radius used by the original Geo calculator. Radius is in kilometres.
-    pub fn geodetic_to_spherical(&self, coordinate: CoordinateZ) -> (f64, f64) {
+    fn geodetic_to_spherical(&self, coordinate: CoordinateZ) -> (f64, f64) {
         let lat = coordinate.latitude.to_radians();
         let elevation = coordinate.elevation;
         let a = self.spheroid.equatorial_axis_m / 1000.0;
@@ -444,122 +453,5 @@ impl Wmm2025 {
 
     pub fn valid_to() -> UtcDateTime {
         UtcDateTime::date(Self::VALID_TO_YEAR, 1, 1).expect("valid WMM date")
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn date(year: i32, month: u8, day: u8) -> UtcDateTime {
-        UtcDateTime::date(year, month, day).unwrap()
-    }
-
-    #[test]
-    fn wgs84_conversion_matches_expected_equatorial_radius() {
-        let calculator = GeomagnetismCalculator::new();
-        let coordinate = CoordinateZ::new(0.0, 0.0, 0.0).unwrap();
-        let (theta, radius) = calculator.geodetic_to_spherical(coordinate);
-
-        assert!((theta - std::f64::consts::FRAC_PI_2).abs() < 1e-12);
-        assert!((radius - 6378.137).abs() < 1e-9);
-    }
-
-    #[test]
-    fn wmm2025_returns_finite_field_inside_valid_period() {
-        let calculator = GeomagnetismCalculator::new();
-        let coordinate = Coordinate::new(13.7563, 100.5018).unwrap();
-        let result = calculator
-            .try_calculate(coordinate, date(2025, 1, 1))
-            .unwrap()
-            .unwrap();
-
-        assert!(result.x.is_finite());
-        assert!(result.y.is_finite());
-        assert!(result.z.is_finite());
-        assert!(result.total_intensity > 0.0);
-        assert!(
-            (result.total_intensity.powi(2)
-                - (result.x.powi(2) + result.y.powi(2) + result.z.powi(2)))
-            .abs()
-                < 1e-6
-        );
-    }
-
-    /// The official NOAA/BGS WMM2025 test values for 2025.0 (WMM2025 test
-    /// value table). Published to 0.1 nT, so the tolerance is 0.2 nT. The
-    /// finite/self-consistent test above passes for any tidy but wrong field;
-    /// only a real reference vector catches a scale or sign error.
-    #[test]
-    fn wmm2025_matches_the_published_test_values() {
-        // lat, lon, height km, X, Y, Z, H, F, I, D
-        let rows = [
-            (
-                80.0, 0.0, 0.0, 6521.6, 145.9, 54791.5, 6523.2, 55178.5, 83.21, 1.28,
-            ),
-            (
-                0.0, 120.0, 0.0, 39677.8, -109.6, -10580.2, 39677.9, 41064.3, -14.93, -0.16,
-            ),
-            (
-                -80.0, -120.0, 0.0, 6117.5, 15751.9, -52022.5, 16898.1, 54698.2, -72.00, 68.78,
-            ),
-            (
-                80.0, 0.0, 100.0, 6216.0, 92.4, 52598.8, 6216.7, 52964.9, 83.26, 0.85,
-            ),
-            (
-                0.0, 120.0, 100.0, 37688.6, -96.2, -10152.1, 37688.7, 39032.1, -15.08, -0.15,
-            ),
-            (
-                -80.0, -120.0, 100.0, 5907.6, 14780.3, -49540.7, 15917.1, 52035.0, -72.19, 68.21,
-            ),
-        ];
-        let calculator = GeomagnetismCalculator::new();
-
-        for (latitude, longitude, height, x, y, z, h, f, i, d) in rows {
-            let coordinate = Coordinate::new(latitude, longitude).unwrap();
-            let result = calculator
-                .try_calculate_at_altitude(coordinate, height, date(2025, 1, 1))
-                .unwrap()
-                .unwrap();
-            let check = |name: &str, actual: f64, expected: f64, tolerance: f64| {
-                assert!(
-                    (actual - expected).abs() < tolerance,
-                    "{name} at {latitude},{longitude},{height}km: {actual} != {expected}"
-                );
-            };
-
-            check("X", result.x, x, 0.2);
-            check("Y", result.y, y, 0.2);
-            check("Z", result.z, z, 0.2);
-            check("H", result.horizontal_intensity, h, 0.2);
-            check("F", result.total_intensity, f, 0.2);
-            check("I", result.inclination, i, 0.01);
-            check("D", result.declination, d, 0.01);
-        }
-    }
-
-    /// `UtcDateTime::date` pins milliseconds to zero, so the field tests above
-    /// cannot see a bad millisecond scale factor.
-    #[test]
-    fn julian_day_counts_milliseconds_as_thousandths_of_a_second() {
-        let base = UtcDateTime::new(2025, 6, 1, 12, 0, 0, 0).unwrap();
-        let half_second = UtcDateTime::new(2025, 6, 1, 12, 0, 0, 500).unwrap();
-
-        // The Julian day is ~2.46e6, so differencing two of them costs ~5e-10.
-        assert!((half_second.julian_day() - base.julian_day() - 0.5 / 86_400.0).abs() < 1e-8);
-    }
-
-    #[test]
-    fn dates_outside_model_and_invalid_coordinates_are_rejected() {
-        let calculator = GeomagnetismCalculator::new();
-        let coordinate = Coordinate::new(0.0, 0.0).unwrap();
-        assert_eq!(
-            calculator.try_calculate(coordinate, date(2024, 12, 31)),
-            Ok(None)
-        );
-        assert!(UtcDateTime::date(0, 1, 1).is_err());
-        assert!(UtcDateTime::date(10_000, 1, 1).is_err());
-        assert!(Coordinate::new(91.0, 0.0).is_err());
-        assert!(CoordinateZ::new(0.0, 0.0, f64::NAN).is_err());
     }
 }

@@ -7,11 +7,14 @@ use egui_plot::{Legend, Line, Plot, PlotPoint, PlotPoints, Points, Text};
 use igrf_core::geomagnetism::{
     Coordinate, GeomagnetismCalculator, GeomagnetismResult, UtcDateTime,
 };
-use igrf_core::satellite::{SatelliteTracker, SatellitePosition, PRESETS};
+use igrf_core::satellite::{
+    elevation_deg, split_dateline_segments, SatellitePosition, SatelliteTracker, PRESETS,
+};
 use igrf_core::{
     contour_segments, field_from_magnitude, AppConfig, CalculationService, CalibrationSettings,
     ContourSegment, FilterSettings, MapGrid, PidController, PidSettings, ProcessedData,
-    SensorService, SetpointProfile, SlewLimiter, FIRMWARE_MAX_OUTPUT, NOMINAL_TICK_SECONDS,
+    SatelliteEntry, SensorService, SetpointProfile, SlewLimiter, FIRMWARE_MAX_OUTPUT,
+    NOMINAL_TICK_SECONDS,
 };
 use igrf_io::{
     write_controller_packet, ControllerReplyCounter, CsvLogger, MagsonSample, MagsonTcpClient,
@@ -71,6 +74,20 @@ const AUTHORITY_RATIO_LIMIT: f64 = 1.5;
 const STOP_RED: Color32 = Color32::from_rgb(170, 45, 45);
 /// Below this the side-by-side X/Y/Z layout stacks vertically instead.
 const MIN_COLUMN_WIDTH: f32 = 190.0;
+/// Points per satellite ground track / field-vs-time curve, spread across
+/// one full orbital period. Fine enough to trace the antimeridian crossing
+/// without dominating a once-a-second recompute.
+const GROUND_TRACK_SAMPLES: usize = 121;
+/// Cycled by index so each tracked satellite gets a stable, distinct color
+/// across the ground-track plot and the field-vs-time legend.
+const SATELLITE_COLORS: [Color32; 6] = [
+    Color32::RED,
+    Color32::from_rgb(80, 200, 120),
+    Color32::from_rgb(90, 150, 240),
+    Color32::from_rgb(230, 170, 60),
+    Color32::from_rgb(200, 90, 220),
+    Color32::from_rgb(80, 220, 220),
+];
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
@@ -168,6 +185,68 @@ impl AppTab {
         match self {
             Self::Control => "IGRF Control",
             Self::Model => "IGRF Model",
+        }
+    }
+}
+
+/// One entry in the "Satellite Position" list: the TLE text plus everything
+/// derived from it each tick. The tracker isn't serializable, so it's
+/// rebuilt from `name`/`line1`/`line2` on add and on config load rather than
+/// persisted itself - see [`igrf_core::SatelliteEntry`].
+struct TrackedSat {
+    name: String,
+    line1: String,
+    line2: String,
+    tracker: Option<SatelliteTracker>,
+    position: Option<SatellitePosition>,
+    field: Option<GeomagnetismResult>,
+    /// Ground track for the current simulated time, one full orbital period
+    /// centered on it. `[longitude, latitude]` pairs, already split at the
+    /// antimeridian - see [`split_dateline_segments`].
+    track_segments: Vec<Vec<[f64; 2]>>,
+    /// Total field intensity across the same track, as
+    /// `[minutes_from_now, nT]` pairs for the field-vs-time plot.
+    field_track: Vec<[f64; 2]>,
+    /// Elevation above the ground station's horizon last tick, so an AOS/LOS
+    /// status message fires on the transition instead of every tick.
+    was_visible: bool,
+    error: Option<String>,
+}
+
+impl TrackedSat {
+    fn new(name: String, line1: String, line2: String) -> Self {
+        let label = if name.trim().is_empty() {
+            "Satellite".to_owned()
+        } else {
+            name.clone()
+        };
+        let (tracker, error) = match SatelliteTracker::from_tle(Some(&label), &line1, &line2) {
+            Ok(tracker) => (Some(tracker), None),
+            Err(error) => (None, Some(error.to_string())),
+        };
+        Self {
+            name: label,
+            line1,
+            line2,
+            tracker,
+            position: None,
+            field: None,
+            track_segments: Vec::new(),
+            field_track: Vec::new(),
+            was_visible: false,
+            error,
+        }
+    }
+
+    fn from_entry(entry: &SatelliteEntry) -> Self {
+        Self::new(entry.name.clone(), entry.line1.clone(), entry.line2.clone())
+    }
+
+    fn to_entry(&self) -> SatelliteEntry {
+        SatelliteEntry {
+            name: self.name.clone(),
+            line1: self.line1.clone(),
+            line2: self.line2.clone(),
         }
     }
 }
@@ -272,18 +351,22 @@ struct IgrfApp {
     /// changing the `Plot`'s egui id so it reinitialises its view.
     map_view_generation: u64,
 
-    /// "Satellite Position" group: TLE tracking and simulated time.
-    satellite_preset: Option<usize>,
-    satellite_name: String,
-    tle_line1: String,
-    tle_line2: String,
-    satellite_tracker: Option<SatelliteTracker>,
+    /// "Satellite Position" group: multiple tracked satellites, a ground
+    /// station for AOS/LOS, and the simulated clock they share.
+    tracked_satellites: Vec<TrackedSat>,
+    /// Draft fields for the "add satellite" form; a preset selection copies
+    /// straight into these, Manual leaves them for the operator to fill in.
+    new_satellite_preset: Option<usize>,
+    new_satellite_name: String,
+    new_tle_line1: String,
+    new_tle_line2: String,
     satellite_tracking: bool,
     sim_time_speed: i32,
     sim_time_offset_s: f64,
     sim_last_tick: Option<Instant>,
-    satellite_position: Option<SatellitePosition>,
-    satellite_field: Option<GeomagnetismResult>,
+    station_lat: f64,
+    station_lon: f64,
+    elevation_mask_deg: f64,
     satellite_error: Option<String>,
 
     active_tab: AppTab,
@@ -391,17 +474,32 @@ impl IgrfApp {
             map_grid_error: None,
             map_contours: None,
             map_view_generation: 0,
-            satellite_preset: Some(0),
-            satellite_name: PRESETS[0].name.to_owned(),
-            tle_line1: PRESETS[0].line1.to_owned(),
-            tle_line2: PRESETS[0].line2.to_owned(),
-            satellite_tracker: None,
+            // An empty config (first run) still gets a ready-to-track example
+            // rather than a blank list.
+            tracked_satellites: if config.satellites.is_empty() {
+                vec![TrackedSat::new(
+                    PRESETS[0].name.to_owned(),
+                    PRESETS[0].line1.to_owned(),
+                    PRESETS[0].line2.to_owned(),
+                )]
+            } else {
+                config
+                    .satellites
+                    .iter()
+                    .map(TrackedSat::from_entry)
+                    .collect()
+            },
+            new_satellite_preset: Some(0),
+            new_satellite_name: PRESETS[0].name.to_owned(),
+            new_tle_line1: PRESETS[0].line1.to_owned(),
+            new_tle_line2: PRESETS[0].line2.to_owned(),
             satellite_tracking: false,
             sim_time_speed: 0,
             sim_time_offset_s: 0.0,
             sim_last_tick: None,
-            satellite_position: None,
-            satellite_field: None,
+            station_lat: config.station_latitude,
+            station_lon: config.station_longitude,
+            elevation_mask_deg: config.elevation_mask_deg,
             satellite_error: None,
             active_tab: AppTab::default(),
             status,
@@ -1394,7 +1492,20 @@ impl IgrfApp {
         self.config.setpoint_source_port = parse_tcp_port(&self.setpoint_port)
             .map(i32::from)
             .unwrap_or(0);
+        self.config.satellites = self
+            .tracked_satellites
+            .iter()
+            .map(TrackedSat::to_entry)
+            .collect();
+        self.config.station_latitude = self.station_lat;
+        self.config.station_longitude = self.station_lon;
+        self.config.elevation_mask_deg = self.elevation_mask_deg;
         let clamped = self.config.sanitize();
+        // sanitize() may have pulled these back inside range; follow it for
+        // the same reason the PID panel does below.
+        self.station_lat = self.config.station_latitude;
+        self.station_lon = self.config.station_longitude;
+        self.elevation_mask_deg = self.config.elevation_mask_deg;
         // Saving writes back whatever sanitize settled on, so the panel has to
         // follow or the UI would keep showing a limit the file no longer holds.
         self.pid_settings = [
@@ -1442,6 +1553,17 @@ impl IgrfApp {
         ];
         self.calibration = config.calibration.clone();
         self.sensor_service.calibration = config.calibration.clone();
+
+        // Trackers aren't serializable, so a loaded satellite list is
+        // rebuilt from its TLE text rather than restored directly.
+        self.tracked_satellites = config
+            .satellites
+            .iter()
+            .map(TrackedSat::from_entry)
+            .collect();
+        self.station_lat = config.station_latitude;
+        self.station_lon = config.station_longitude;
+        self.elevation_mask_deg = config.elevation_mask_deg;
 
         self.profile_path = config.setpoint_profile_path.clone();
         self.slew_rate = config.setpoint_slew_nt_per_second.to_string();
@@ -1574,25 +1696,46 @@ impl IgrfApp {
         self.map_grid_error = None;
     }
 
-    /// Generate Results: parse the TLE and start the tracking loop
-    fn start_satellite_tracking(&mut self) {
-        let name = self.satellite_name.trim();
-        let name = if name.is_empty() { None } else { Some(name) };
-        match SatelliteTracker::from_tle(name, self.tle_line1.trim(), self.tle_line2.trim()) {
-            Ok(tracker) => {
-                self.satellite_tracker = Some(tracker);
-                self.satellite_tracking = true;
-                self.sim_time_offset_s = 0.0;
-                self.sim_last_tick = None;
-                self.satellite_error = None;
-                self.set_status("Satellite tracking started");
-            }
-            Err(error) => {
-                self.satellite_tracker = None;
-                self.satellite_tracking = false;
-                self.satellite_error = Some(error.to_string());
-            }
+    /// Parses the draft TLE fields and appends a new tracked satellite,
+    /// whether or not tracking is currently running. Kept even on a TLE
+    /// parse error so a typo shows up in the list next to a message instead
+    /// of just vanishing.
+    fn add_satellite(&mut self) {
+        let sat = TrackedSat::new(
+            self.new_satellite_name.trim().to_owned(),
+            self.new_tle_line1.trim().to_owned(),
+            self.new_tle_line2.trim().to_owned(),
+        );
+        let error = sat.error.clone();
+        self.tracked_satellites.push(sat);
+        match error {
+            Some(error) => self.set_error(format!("Satellite added, but TLE is invalid: {error}")),
+            None => self.set_status("Satellite added"),
         }
+    }
+
+    fn remove_satellite(&mut self, index: usize) {
+        if index < self.tracked_satellites.len() {
+            self.tracked_satellites.remove(index);
+        }
+    }
+
+    /// Starts the shared simulated clock driving every tracked satellite.
+    fn start_satellite_tracking(&mut self) {
+        if self.tracked_satellites.is_empty() {
+            self.satellite_error = Some("Add at least one satellite first".to_owned());
+            return;
+        }
+        self.satellite_tracking = true;
+        self.sim_time_offset_s = 0.0;
+        self.sim_last_tick = None;
+        self.satellite_error = None;
+        // Otherwise a satellite already above the mask at start would fire a
+        // spurious AOS the instant tracking begins.
+        for sat in &mut self.tracked_satellites {
+            sat.was_visible = false;
+        }
+        self.set_status("Satellite tracking started");
     }
 
     fn stop_satellite_tracking(&mut self) {
@@ -1601,7 +1744,8 @@ impl IgrfApp {
 
     // Get time
     fn simulated_time(&self) -> Option<UtcDateTime> {
-        let offset = chrono::Duration::milliseconds((self.sim_time_offset_s * 1000.0).round() as i64);
+        let offset =
+            chrono::Duration::milliseconds((self.sim_time_offset_s * 1000.0).round() as i64);
         let now = chrono::Utc::now().checked_add_signed(offset)?;
         UtcDateTime::new(
             now.year(),
@@ -1615,13 +1759,15 @@ impl IgrfApp {
         .ok()
     }
 
+    /// Advances the shared simulated clock once a second (real time) and
+    /// re-propagates every tracked satellite to it: position, field, ground
+    /// track, field-vs-time samples, and the AOS/LOS edge against the
+    /// ground station. Gated to 1 Hz already, so recomputing a whole orbit's
+    /// worth of samples per satellite here is cheap - no extra caching.
     fn tick_satellite_tracking(&mut self) {
-        if !self.satellite_tracking {
+        if !self.satellite_tracking || self.tracked_satellites.is_empty() {
             return;
         }
-        let Some(tracker) = &self.satellite_tracker else {
-            return;
-        };
         let now = Instant::now();
         if let Some(last) = self.sim_last_tick {
             if now.duration_since(last) < Duration::from_secs(1) {
@@ -1635,24 +1781,87 @@ impl IgrfApp {
             self.satellite_error = Some("simulated time is out of range".to_owned());
             return;
         };
-        match tracker.position_at(time) {
-            Ok(position) => {
-                self.satellite_error = None;
-                self.satellite_field = Coordinate::new(position.latitude, position.longitude)
-                    .ok()
-                    .and_then(|coordinate| {
-                        GeomagnetismCalculator::new()
-                            .try_calculate_at_altitude(coordinate, position.altitude_km, time)
-                            .ok()
-                            .flatten()
-                    });
-                self.satellite_position = Some(position);
+        self.satellite_error = None;
+
+        let station_lat = self.station_lat;
+        let station_lon = self.station_lon;
+        let mask = self.elevation_mask_deg;
+        let calculator = GeomagnetismCalculator::new();
+        // Collected rather than overwritten, so two satellites crossing the
+        // mask in the same tick both get reported instead of one clobbering
+        // the other in the status bar.
+        let mut aos_los_messages = Vec::new();
+
+        for sat in &mut self.tracked_satellites {
+            let Some(tracker) = &sat.tracker else {
+                continue;
+            };
+            match tracker.position_at(time) {
+                Ok(position) => {
+                    sat.error = None;
+                    sat.field = Coordinate::new(position.latitude, position.longitude)
+                        .ok()
+                        .and_then(|coordinate| {
+                            calculator
+                                .try_calculate_at_altitude(coordinate, position.altitude_km, time)
+                                .ok()
+                                .flatten()
+                        });
+
+                    let elevation = elevation_deg(station_lat, station_lon, position.ecef_km);
+                    let visible = elevation >= mask;
+                    if visible != sat.was_visible {
+                        aos_los_messages.push(format!(
+                            "{}: {} (elevation {elevation:.1} deg)",
+                            sat.name,
+                            if visible { "AOS" } else { "LOS" }
+                        ));
+                    }
+                    sat.was_visible = visible;
+
+                    match tracker.ground_track(time, GROUND_TRACK_SAMPLES) {
+                        Ok(track) => {
+                            sat.track_segments = split_dateline_segments(&track);
+                            let period = tracker.orbital_period_minutes();
+                            let samples = track.len().max(2);
+                            sat.field_track = track
+                                .iter()
+                                .enumerate()
+                                .filter_map(|(index, sample)| {
+                                    let minutes =
+                                        (index as f64 / (samples - 1) as f64 - 0.5) * period;
+                                    let coordinate =
+                                        Coordinate::new(sample.latitude, sample.longitude).ok()?;
+                                    let field = calculator
+                                        .try_calculate_at_altitude(
+                                            coordinate,
+                                            sample.altitude_km,
+                                            time,
+                                        )
+                                        .ok()??;
+                                    Some([minutes, field.total_intensity])
+                                })
+                                .collect();
+                        }
+                        Err(_) => {
+                            sat.track_segments.clear();
+                            sat.field_track.clear();
+                        }
+                    }
+                    sat.position = Some(position);
+                }
+                Err(error) => {
+                    sat.error = Some(error.to_string());
+                    sat.position = None;
+                    sat.field = None;
+                    sat.track_segments.clear();
+                    sat.field_track.clear();
+                }
             }
-            Err(error) => {
-                self.satellite_error = Some(error.to_string());
-                self.satellite_position = None;
-                self.satellite_field = None;
-            }
+        }
+
+        if !aos_los_messages.is_empty() {
+            self.set_status(aos_los_messages.join("; "));
         }
     }
 
@@ -1695,13 +1904,10 @@ impl IgrfApp {
         ui.horizontal(|ui| {
             for tab in [AppTab::Control, AppTab::Model] {
                 let selected = self.active_tab == tab;
-                let button = egui::Button::new(
-                    egui::RichText::new(tab.label())
-                        .strong()
-                        .size(15.0),
-                )
-                .selected(selected)
-                .min_size(egui::vec2(120.0, 28.0));
+                let button =
+                    egui::Button::new(egui::RichText::new(tab.label()).strong().size(15.0))
+                        .selected(selected)
+                        .min_size(egui::vec2(120.0, 28.0));
                 if ui.add(button).clicked() {
                     self.active_tab = tab;
                 }
@@ -2260,50 +2466,45 @@ impl IgrfApp {
         ));
     }
 
-    /// Satellite Position group: SGP4 propagation and the
-    /// TEME->geodetic conversion happen in `igrf_core::satellite`; this
-    /// owns the TLE text fields, the tracking toggle, and the simulated
-    /// clock's speed/offset.
+    /// Satellite Position group: SGP4 propagation and the TEME->geodetic
+    /// conversion happen in `igrf_core::satellite`; this owns the tracked
+    /// satellite list, the "add satellite" draft fields, the ground station
+    /// used for AOS/LOS, and the simulated clock's speed/offset.
     fn show_satellite_panel(&mut self, ui: &mut egui::Ui) {
+        ui.label(egui::RichText::new("Add satellite").strong());
         egui::ComboBox::from_id_salt("satellite-preset")
-            .selected_text(match self.satellite_preset {
+            .selected_text(match self.new_satellite_preset {
                 Some(index) => PRESETS[index].name,
                 None => "-- Manual --",
             })
             .show_ui(ui, |ui| {
                 if ui
-                    .selectable_label(self.satellite_preset.is_none(), "-- Manual --")
+                    .selectable_label(self.new_satellite_preset.is_none(), "-- Manual --")
                     .clicked()
                 {
-                    self.satellite_preset = None;
+                    self.new_satellite_preset = None;
                 }
                 for (index, preset) in PRESETS.iter().enumerate() {
                     if ui
-                        .selectable_label(self.satellite_preset == Some(index), preset.name)
+                        .selectable_label(self.new_satellite_preset == Some(index), preset.name)
                         .clicked()
                     {
-                        self.satellite_preset = Some(index);
-                        self.satellite_name = preset.name.to_owned();
-                        self.tle_line1 = preset.line1.to_owned();
-                        self.tle_line2 = preset.line2.to_owned();
-                        // Switching satellites mid-track should jump straight
-                        // to the new one's live results, not leave the old
-                        // tracker running until an explicit Stop+Generate.
-                        if self.satellite_tracking {
-                            self.start_satellite_tracking();
-                        }
+                        self.new_satellite_preset = Some(index);
+                        self.new_satellite_name = preset.name.to_owned();
+                        self.new_tle_line1 = preset.line1.to_owned();
+                        self.new_tle_line2 = preset.line2.to_owned();
                     }
                 }
             });
 
         ui.horizontal(|ui| {
             ui.label("Name");
-            ui.text_edit_singleline(&mut self.satellite_name);
+            ui.text_edit_singleline(&mut self.new_satellite_name);
         });
         ui.horizontal(|ui| {
             ui.label("Line 1");
             ui.add(
-                egui::TextEdit::singleline(&mut self.tle_line1)
+                egui::TextEdit::singleline(&mut self.new_tle_line1)
                     .desired_width(300.0)
                     .font(egui::TextStyle::Monospace),
             );
@@ -2311,12 +2512,48 @@ impl IgrfApp {
         ui.horizontal(|ui| {
             ui.label("Line 2");
             ui.add(
-                egui::TextEdit::singleline(&mut self.tle_line2)
+                egui::TextEdit::singleline(&mut self.new_tle_line2)
                     .desired_width(300.0)
                     .font(egui::TextStyle::Monospace),
             );
         });
+        if ui.button("Add satellite").clicked() {
+            self.add_satellite();
+        }
 
+        ui.add_space(8.0);
+        ui.separator();
+        ui.label(egui::RichText::new("Ground station (AOS/LOS)").strong());
+        ui.horizontal(|ui| {
+            ui.label("Latitude");
+            ui.add(
+                egui::DragValue::new(&mut self.station_lat)
+                    .speed(0.01)
+                    .range(-90.0..=90.0),
+            );
+            ui.label("Longitude");
+            ui.add(
+                egui::DragValue::new(&mut self.station_lon)
+                    .speed(0.01)
+                    .range(-180.0..=180.0),
+            );
+        });
+        ui.horizontal(|ui| {
+            ui.label("Elevation mask (deg)");
+            ui.add(
+                egui::DragValue::new(&mut self.elevation_mask_deg)
+                    .speed(0.1)
+                    .range(0.0..=90.0),
+            );
+        });
+        ui.label(
+            egui::RichText::new("Save SystemConfig.json to keep the satellite list and station")
+                .small()
+                .weak(),
+        );
+
+        ui.add_space(8.0);
+        ui.separator();
         ui.horizontal(|ui| {
             if self.satellite_tracking {
                 if ui.button("Stop Tracking").clicked() {
@@ -2350,44 +2587,70 @@ impl IgrfApp {
 
         ui.add_space(8.0);
         ui.separator();
-        ui.label(egui::RichText::new("Satellite Result").strong());
-        match self.satellite_position {
-            Some(position) => {
-                let field = self.satellite_field;
-                egui::Grid::new("satellite-position-result-grid")
-                    .num_columns(2)
-                    .striped(true)
-                    .show(ui, |ui| {
-                        ui.label("Latitude");
-                        ui.label(format!("{:.3}", position.latitude));
-                        ui.end_row();
-                        ui.label("Longitude");
-                        ui.label(format!("{:.3}", position.longitude));
-                        ui.end_row();
-                        ui.label("Altitude km");
-                        ui.label(format!("{:.3}", position.altitude_km));
-                        ui.end_row();
-                        ui.label("Total Intensity");
-                        match field.map(|f| f.total_intensity) {
-                            Some(value) => ui.label(format!("{value:.3}")),
-                            None => ui.label("--"),
-                        };
-                        ui.end_row();
-                        // The satellite's TEME position (km) X/Y/Z
-                        for (label, value) in [
-                            ("X", position.teme_x_km),
-                            ("Y", position.teme_y_km),
-                            ("Z", position.teme_z_km),
-                        ] {
-                            ui.label(label);
-                            ui.label(format!("{value:.3}"));
-                            ui.end_row();
-                        }
-                    });
-            }
-            None => {
-                ui.label("No satellite result yet. Press \"Generate Results\" to start tracking.");
-            }
+        ui.label(egui::RichText::new("Tracked satellites").strong());
+        if self.tracked_satellites.is_empty() {
+            ui.label("No satellites yet. Add one above.");
+        }
+        let mut to_remove = None;
+        for (index, sat) in self.tracked_satellites.iter().enumerate() {
+            let color = SATELLITE_COLORS[index % SATELLITE_COLORS.len()];
+            ui.group(|ui| {
+                ui.horizontal(|ui| {
+                    ui.colored_label(color, "\u{25cf}");
+                    ui.label(egui::RichText::new(&sat.name).strong());
+                    if ui.small_button("Remove").clicked() {
+                        to_remove = Some(index);
+                    }
+                });
+                if let Some(error) = &sat.error {
+                    ui.colored_label(Color32::LIGHT_RED, error);
+                }
+                match (sat.position, sat.field) {
+                    (Some(position), field) => {
+                        egui::Grid::new(("satellite-result-grid", index))
+                            .num_columns(2)
+                            .striped(true)
+                            .show(ui, |ui| {
+                                ui.label("Latitude");
+                                ui.label(format!("{:.3}", position.latitude));
+                                ui.end_row();
+                                ui.label("Longitude");
+                                ui.label(format!("{:.3}", position.longitude));
+                                ui.end_row();
+                                ui.label("Altitude km");
+                                ui.label(format!("{:.3}", position.altitude_km));
+                                ui.end_row();
+                                ui.label("Total Intensity");
+                                match field.map(|f| f.total_intensity) {
+                                    Some(value) => ui.label(format!("{value:.3}")),
+                                    None => ui.label("--"),
+                                };
+                                ui.end_row();
+                                ui.label("Elevation");
+                                let elevation = elevation_deg(
+                                    self.station_lat,
+                                    self.station_lon,
+                                    position.ecef_km,
+                                );
+                                ui.label(format!(
+                                    "{elevation:.1} deg ({})",
+                                    if sat.was_visible {
+                                        "visible"
+                                    } else {
+                                        "below mask"
+                                    }
+                                ));
+                                ui.end_row();
+                            });
+                    }
+                    (None, _) => {
+                        ui.label("No result yet - press \"Generate Results\".");
+                    }
+                }
+            });
+        }
+        if let Some(index) = to_remove {
+            self.remove_satellite(index);
         }
     }
 
@@ -2411,8 +2674,6 @@ impl IgrfApp {
                         ));
                     }
                 }
-                let satellite_position = self.satellite_position;
-
                 Plot::new(("model-map", self.map_view_generation))
                     .x_axis_label("Longitude")
                     .y_axis_label("Latitude")
@@ -2437,15 +2698,39 @@ impl IgrfApp {
                                 .color(CONTOUR_LINE_COLOR),
                             );
                         }
-                        if let Some(position) = satellite_position {
-                            plot_ui.points(
-                                Points::new(
-                                    "Satellite",
-                                    vec![[position.longitude, position.latitude]],
-                                )
-                                .radius(5.0)
-                                .color(Color32::RED),
-                            );
+                        // Ground track + current position per tracked
+                        // satellite. Colors match the list in the left
+                        // panel, which doubles as the legend - a `.legend()`
+                        // here would otherwise also pick up every contour
+                        // segment above.
+                        for (index, sat) in self.tracked_satellites.iter().enumerate() {
+                            let color = SATELLITE_COLORS[index % SATELLITE_COLORS.len()];
+                            // `.id(...)` overrides the id egui_plot would
+                            // otherwise derive from `name` alone, which
+                            // would collide if two entries share a name
+                            // (e.g. the ISS preset added twice).
+                            for (segment_index, segment) in sat.track_segments.iter().enumerate() {
+                                plot_ui.line(
+                                    Line::new(sat.name.clone(), PlotPoints::new(segment.clone()))
+                                        .id(egui::Id::new((
+                                            "satellite-track",
+                                            index,
+                                            segment_index,
+                                        )))
+                                        .color(color),
+                                );
+                            }
+                            if let Some(position) = sat.position {
+                                plot_ui.points(
+                                    Points::new(
+                                        sat.name.clone(),
+                                        vec![[position.longitude, position.latitude]],
+                                    )
+                                    .id(egui::Id::new(("satellite-point", index)))
+                                    .radius(5.0)
+                                    .color(color),
+                                );
+                            }
                         }
                     });
             }
@@ -2455,6 +2740,33 @@ impl IgrfApp {
             None => {
                 ui.label("No geomagnetic field map generated yet.");
             }
+        }
+
+        if self
+            .tracked_satellites
+            .iter()
+            .any(|sat| !sat.field_track.is_empty())
+        {
+            ui.add_space(8.0);
+            ui.heading("Satellite field intensity vs time");
+            Plot::new("satellite-field-vs-time")
+                .x_axis_label("Minutes from simulated time")
+                .y_axis_label("Total intensity (nT)")
+                .height(280.0)
+                .legend(Legend::default())
+                .show(ui, |plot_ui| {
+                    for (index, sat) in self.tracked_satellites.iter().enumerate() {
+                        if sat.field_track.is_empty() {
+                            continue;
+                        }
+                        let color = SATELLITE_COLORS[index % SATELLITE_COLORS.len()];
+                        plot_ui.line(
+                            Line::new(sat.name.clone(), PlotPoints::new(sat.field_track.clone()))
+                                .id(egui::Id::new(("satellite-field", index)))
+                                .color(color),
+                        );
+                    }
+                });
         }
     }
 

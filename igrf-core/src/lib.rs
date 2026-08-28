@@ -14,7 +14,7 @@ pub use calculation::{
     CalculationError, CalculationService, ProcessedData, DEFAULT_SPIKE_THRESHOLD_NT, REJECTS_BEFORE_FAULT,
 };
 pub use contour::{contour_segments, ContourSegment};
-pub use config::{AppConfig, CalibrationSettings, FilterSettings, PidSettings};
+pub use config::{AppConfig, CalibrationSettings, FilterSettings, PidSettings, SatelliteEntry};
 pub use kalman::KalmanFilter;
 pub use map_grid::MapGrid;
 pub use packet::{

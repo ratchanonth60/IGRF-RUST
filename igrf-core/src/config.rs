@@ -201,6 +201,19 @@ impl CalibrationSettings {
     }
 }
 
+/// One tracked satellite as saved to `SystemConfig.json`: just the TLE text.
+/// The runtime `SatelliteTracker` (parsed elements + SGP4 constants) is
+/// rebuilt from this on load, since it isn't serializable.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SatelliteEntry {
+    #[serde(rename = "Name", default)]
+    pub name: String,
+    #[serde(rename = "Line1", default)]
+    pub line1: String,
+    #[serde(rename = "Line2", default)]
+    pub line2: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AppConfig {
     #[serde(rename = "PidX", default)]
@@ -240,6 +253,17 @@ pub struct AppConfig {
     pub controller_port: String,
     #[serde(rename = "ControllerBaud", default = "default_baud")]
     pub controller_baud: u32,
+    /// "Satellite Position" group, persisted so a restart doesn't lose the
+    /// operator's tracking list and ground station.
+    #[serde(rename = "Satellites", default)]
+    pub satellites: Vec<SatelliteEntry>,
+    #[serde(rename = "StationLatitude", default = "default_station_latitude")]
+    pub station_latitude: f64,
+    #[serde(rename = "StationLongitude", default = "default_station_longitude")]
+    pub station_longitude: f64,
+    /// Minimum elevation, degrees above the horizon, counted as AOS.
+    #[serde(rename = "ElevationMaskDeg", default = "default_elevation_mask")]
+    pub elevation_mask_deg: f64,
 }
 
 fn default_sensor2_ip() -> String {
@@ -266,6 +290,23 @@ fn default_bind_address() -> String {
     "127.0.0.1".to_owned()
 }
 
+/// 10 degrees: a common baseline minimum elevation for ground-station
+/// visibility, low enough to catch most of a pass without counting terrain-
+/// grazing horizon noise as AOS.
+fn default_elevation_mask() -> f64 {
+    10.0
+}
+
+/// Matches the app's `manual_lat`/`manual_lon` fallback for the same reason:
+/// this build runs against a bench in Bangkok.
+fn default_station_latitude() -> f64 {
+    13.7563
+}
+
+fn default_station_longitude() -> f64 {
+    100.5018
+}
+
 impl Default for AppConfig {
     fn default() -> Self {
         Self {
@@ -286,6 +327,13 @@ impl Default for AppConfig {
             sensor_baud: default_baud(),
             controller_port: String::new(),
             controller_baud: default_baud(),
+            satellites: Vec::new(),
+            // Same fallback the manual WMM calculator uses: Bangkok, rather
+            // than Null Island, which would fire AOS/LOS on whatever
+            // happens to cross the Gulf of Guinea.
+            station_latitude: default_station_latitude(),
+            station_longitude: default_station_longitude(),
+            elevation_mask_deg: default_elevation_mask(),
         }
     }
 }
@@ -328,6 +376,18 @@ impl AppConfig {
         }
         if self.controller_baud == 0 {
             self.controller_baud = default_baud();
+        }
+        if !self.station_latitude.is_finite() || !(-90.0..=90.0).contains(&self.station_latitude) {
+            self.station_latitude = default_station_latitude();
+        }
+        if !self.station_longitude.is_finite()
+            || !(-180.0..=180.0).contains(&self.station_longitude)
+        {
+            self.station_longitude = default_station_longitude();
+        }
+        if !self.elevation_mask_deg.is_finite() || !(0.0..=90.0).contains(&self.elevation_mask_deg)
+        {
+            self.elevation_mask_deg = default_elevation_mask();
         }
         clamped
     }

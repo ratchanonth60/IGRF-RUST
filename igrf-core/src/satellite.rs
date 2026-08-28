@@ -3,7 +3,7 @@
 
 use std::fmt;
 
-use chrono::NaiveDate;
+use chrono::{Datelike, NaiveDate, Timelike};
 
 use crate::geomagnetism::{UtcDateTime, Wgs84};
 
@@ -36,6 +36,9 @@ pub struct SatellitePosition {
     pub teme_x_km: f64,
     pub teme_y_km: f64,
     pub teme_z_km: f64,
+    /// Earth-fixed (ECEF) position, kilometers. Same frame `elevation_deg`
+    /// expects for a ground station.
+    pub ecef_km: [f64; 3],
 }
 
 /// A parsed TLE ready to propagate, this owns the SGP4 orbital elements and constants
@@ -79,7 +82,34 @@ impl SatelliteTracker {
             teme_x_km: prediction.position[0],
             teme_y_km: prediction.position[1],
             teme_z_km: prediction.position[2],
+            ecef_km: ecef,
         })
+    }
+
+    /// Orbital period implied by the TLE's mean motion (revolutions/day).
+    pub fn orbital_period_minutes(&self) -> f64 {
+        1440.0 / self.elements.mean_motion
+    }
+
+    /// Samples positions across one full orbital period centered on `center`
+    /// (`center - period/2` .. `center + period/2`), for drawing a ground
+    /// track. `samples` is clamped to at least 2.
+    pub fn ground_track(
+        &self,
+        center: UtcDateTime,
+        samples: usize,
+    ) -> Result<Vec<SatellitePosition>, SatelliteError> {
+        let period_minutes = self.orbital_period_minutes();
+        let naive_center = to_naive_datetime(center)?;
+        let samples = samples.max(2);
+        (0..samples)
+            .map(|index| {
+                let frac = index as f64 / (samples - 1) as f64 - 0.5;
+                let offset_ms = (frac * period_minutes * 60_000.0).round() as i64;
+                let time = naive_center + chrono::Duration::milliseconds(offset_ms);
+                self.position_at(naive_to_utc_datetime(time)?)
+            })
+            .collect()
     }
 }
 
@@ -93,6 +123,19 @@ fn to_naive_datetime(time: UtcDateTime) -> Result<chrono::NaiveDateTime, Satelli
         time.millisecond as u32,
     )
     .ok_or_else(|| SatelliteError::Conversion("invalid time of day".to_owned()))
+}
+
+fn naive_to_utc_datetime(time: chrono::NaiveDateTime) -> Result<UtcDateTime, SatelliteError> {
+    UtcDateTime::new(
+        time.year(),
+        time.month() as u8,
+        time.day() as u8,
+        time.hour() as u8,
+        time.minute() as u8,
+        time.second() as u8,
+        (time.and_utc().timestamp_subsec_millis()) as u16,
+    )
+    .map_err(|error| SatelliteError::Conversion(error.to_string()))
 }
 
 /// Rotate a TEME position into an Earth-fixed frame by Greenwich Mean
@@ -127,6 +170,73 @@ fn ecef_to_geodetic(ecef_km: [f64; 3], spheroid: Wgs84) -> (f64, f64, f64) {
     let height = p / cos_lat - n;
 
     (latitude.to_degrees(), longitude.to_degrees(), height)
+}
+
+/// Geodetic latitude/longitude (degrees) and altitude (km) -> ECEF (km).
+/// Inverse of [`ecef_to_geodetic`]; used to place the ground station in the
+/// same frame as a satellite's `ecef_km` for elevation.
+pub fn geodetic_to_ecef(latitude_deg: f64, longitude_deg: f64, altitude_km: f64) -> [f64; 3] {
+    let spheroid = Wgs84::default();
+    let a = spheroid.equatorial_axis_m / 1000.0;
+    let e2 = spheroid.eccentricity().powi(2);
+    let lat = latitude_deg.to_radians();
+    let lon = longitude_deg.to_radians();
+    let (sin_lat, cos_lat) = lat.sin_cos();
+    let (sin_lon, cos_lon) = lon.sin_cos();
+    let n = a / (1.0 - e2 * sin_lat * sin_lat).sqrt();
+    [
+        (n + altitude_km) * cos_lat * cos_lon,
+        (n + altitude_km) * cos_lat * sin_lon,
+        (n * (1.0 - e2) + altitude_km) * sin_lat,
+    ]
+}
+
+/// Elevation angle (degrees) of `target_ecef_km` as seen from a ground
+/// station at sea level at `station_lat_deg`/`station_lon_deg`, via the
+/// local East-North-Up frame. 90 degrees is straight overhead, 0 is the
+/// horizon, negative is below it.
+pub fn elevation_deg(station_lat_deg: f64, station_lon_deg: f64, target_ecef_km: [f64; 3]) -> f64 {
+    let station_ecef = geodetic_to_ecef(station_lat_deg, station_lon_deg, 0.0);
+    let lat = station_lat_deg.to_radians();
+    let lon = station_lon_deg.to_radians();
+    let (sin_lat, cos_lat) = lat.sin_cos();
+    let (sin_lon, cos_lon) = lon.sin_cos();
+
+    let dx = target_ecef_km[0] - station_ecef[0];
+    let dy = target_ecef_km[1] - station_ecef[1];
+    let dz = target_ecef_km[2] - station_ecef[2];
+
+    let north = -sin_lat * cos_lon * dx - sin_lat * sin_lon * dy + cos_lat * dz;
+    let east = -sin_lon * dx + cos_lon * dy;
+    let up = cos_lat * cos_lon * dx + cos_lat * sin_lon * dy + sin_lat * dz;
+
+    let range = (east * east + north * north + up * up).sqrt();
+    (up / range).asin().to_degrees()
+}
+
+/// Splits a ground track into separate polylines wherever consecutive
+/// samples jump more than 180 degrees in longitude, so a plot draws the
+/// antimeridian crossing as a break instead of a line straight across the
+/// map. Returns `[longitude, latitude]` pairs per point, ready for
+/// `egui_plot::PlotPoints`.
+pub fn split_dateline_segments(track: &[SatellitePosition]) -> Vec<Vec<[f64; 2]>> {
+    let mut segments = Vec::new();
+    let mut current: Vec<[f64; 2]> = Vec::new();
+    let mut previous_longitude: Option<f64> = None;
+
+    for position in track {
+        if let Some(previous) = previous_longitude {
+            if (position.longitude - previous).abs() > 180.0 && !current.is_empty() {
+                segments.push(std::mem::take(&mut current));
+            }
+        }
+        current.push([position.longitude, position.latitude]);
+        previous_longitude = Some(position.longitude);
+    }
+    if !current.is_empty() {
+        segments.push(current);
+    }
+    segments
 }
 
 /// The satellite presets
@@ -184,3 +294,79 @@ pub const PRESETS: &[SatellitePreset] = &[
         line2: "2 40732   2.8710  71.8338 0001172 241.7640 161.3542  1.00267859  5905",
     },
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn iss_tracker() -> SatelliteTracker {
+        let preset = PRESETS[0];
+        SatelliteTracker::from_tle(Some(preset.name), preset.line1, preset.line2).unwrap()
+    }
+
+    #[test]
+    fn iss_orbital_period_is_about_93_minutes() {
+        let period = iss_tracker().orbital_period_minutes();
+        assert!(
+            (period - 93.0).abs() < 1.0,
+            "expected ~93 min, got {period}"
+        );
+    }
+
+    #[test]
+    fn elevation_is_near_90_degrees_directly_under_the_satellite() {
+        let tracker = iss_tracker();
+        let time = UtcDateTime::date(2026, 3, 1).unwrap();
+        let position = tracker.position_at(time).unwrap();
+
+        // The station sits at the satellite's own subpoint, so straight up
+        // from the station should point almost exactly at the satellite.
+        let elevation = elevation_deg(position.latitude, position.longitude, position.ecef_km);
+        assert!(
+            elevation > 89.9,
+            "expected elevation near 90 deg, got {elevation}"
+        );
+    }
+
+    #[test]
+    fn ground_track_returns_the_requested_sample_count() {
+        let tracker = iss_tracker();
+        let time = UtcDateTime::date(2026, 3, 1).unwrap();
+        let track = tracker.ground_track(time, 41).unwrap();
+        assert_eq!(track.len(), 41);
+    }
+
+    fn pos(latitude: f64, longitude: f64) -> SatellitePosition {
+        SatellitePosition {
+            latitude,
+            longitude,
+            altitude_km: 400.0,
+            teme_x_km: 0.0,
+            teme_y_km: 0.0,
+            teme_z_km: 0.0,
+            ecef_km: [0.0; 3],
+        }
+    }
+
+    #[test]
+    fn a_track_crossing_the_dateline_splits_into_two_segments() {
+        let track = vec![
+            pos(0.0, 170.0),
+            pos(1.0, 175.0),
+            pos(2.0, -178.0),
+            pos(3.0, -170.0),
+        ];
+        let segments = split_dateline_segments(&track);
+        assert_eq!(segments.len(), 2);
+        assert_eq!(segments[0].len(), 2);
+        assert_eq!(segments[1].len(), 2);
+    }
+
+    #[test]
+    fn a_track_that_never_crosses_the_dateline_stays_one_segment() {
+        let track = vec![pos(0.0, -10.0), pos(1.0, 0.0), pos(2.0, 10.0)];
+        let segments = split_dateline_segments(&track);
+        assert_eq!(segments.len(), 1);
+        assert_eq!(segments[0].len(), 3);
+    }
+}

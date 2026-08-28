@@ -22,6 +22,7 @@ igrf-core = { path = "../igrf-core" }
 igrf-io = { path = "../igrf-io" }
 rfd = "0.17"
 serialport = "4.9"
+dotenvy = "0.15"
 
 # Windowing backends are platform specific: asking for x11 on Windows fails to
 # build, and leaving both off on Linux leaves eframe with no backend at all.

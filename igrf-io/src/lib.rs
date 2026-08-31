@@ -17,5 +17,6 @@ pub use spacetrack::{
     Credentials, SpaceTrackClient, SpaceTrackError, SpaceTrackTle, IDENTITY_ENV, PASSWORD_ENV,
 };
 pub use tle_store::{
-    refresh_from_spacetrack, RefreshError, StoredTle, TleFilter, TlePage, TleStore, TleStoreError,
+    fetch_object_type, refresh_from_spacetrack, RefreshError, StoredTle, TleFilter, TlePage,
+    TleStore, TleStoreError,
 };

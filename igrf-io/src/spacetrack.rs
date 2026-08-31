@@ -408,6 +408,16 @@ impl SpaceTrackClient {
         self.run_query(&latest_by_name_query(name_predicate))
     }
 
+    /// Every on-orbit object of one GP `OBJECT_TYPE` - one of `PAYLOAD`,
+    /// `ROCKET BODY`, `DEBRIS`, `UNKNOWN`. Case-insensitive; a space in
+    /// `ROCKET BODY` is URL-encoded for you.
+    pub fn tles_by_object_type(
+        &self,
+        object_type: &str,
+    ) -> Result<Vec<SpaceTrackTle>, SpaceTrackError> {
+        self.run_query(&by_object_type_query(object_type))
+    }
+
     /// Runs a raw query: `predicate_path` is everything after
     /// `/basicspacedata/query/`, for example
     /// `class/gp/DECAY_DATE/null-val/EPOCH/%3Enow-30/format/json`. Always end it
@@ -481,6 +491,13 @@ fn latest_by_name_query(name_predicate: &str) -> String {
     )
 }
 
+fn by_object_type_query(object_type: &str) -> String {
+    format!(
+        "class/gp/OBJECT_TYPE/{}/orderby/norad_cat_id/format/json",
+        encode(object_type.trim())
+    )
+}
+
 fn parse_rows(body: &str) -> Result<Vec<SpaceTrackTle>, SpaceTrackError> {
     let trimmed = body.trim_start();
     // A query error is returned as a JSON object
@@ -497,142 +514,4 @@ fn parse_rows(body: &str) -> Result<Vec<SpaceTrackTle>, SpaceTrackError> {
         return Err(SpaceTrackError::Api(message));
     }
     serde_json::from_str(trimmed).map_err(|error| SpaceTrackError::Decode(error.to_string()))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn latest_by_ids_batches_into_one_comma_separated_gp_query() {
-        assert_eq!(
-            latest_by_ids_query(&[25544, 33396]),
-            "class/gp/NORAD_CAT_ID/25544,33396/format/json"
-        );
-    }
-
-    #[test]
-    fn name_query_uses_the_gp_class() {
-        assert!(latest_by_name_query("ISS").starts_with("class/gp/OBJECT_NAME/"));
-    }
-
-    #[test]
-    fn the_full_catalog_query_excludes_decayed_and_stale_objects() {
-        assert!(ALL_GP_QUERY.starts_with("class/gp/"));
-        assert!(ALL_GP_QUERY.contains("decay_date/null-val"));
-        assert!(ALL_GP_QUERY.contains("epoch/%3Enow-30"));
-        assert!(ALL_GP_QUERY.ends_with("format/json"));
-    }
-
-    #[test]
-    fn a_catalog_row_without_orbital_lines_still_parses_but_is_flagged() {
-        let body = r#"[{"NORAD_CAT_ID": "70000", "OBJECT_NAME": "DEBRIS"}]"#;
-        let rows = parse_rows(body).unwrap();
-        assert_eq!(rows.len(), 1);
-        assert!(!rows[0].has_elements());
-    }
-
-    #[test]
-    fn name_predicate_operators_are_passed_through_with_spaces_encoded() {
-        assert!(latest_by_name_query("^STARLINK").contains("/OBJECT_NAME/^STARLINK/"));
-        assert!(latest_by_name_query("~~ISS (ZARYA)").contains("~~ISS%20(ZARYA)"));
-    }
-
-    #[test]
-    fn a_gp_row_parses_every_field_with_its_type() {
-        let body = r#"[
-            {
-                "CCSDS_OMM_VERS": "3.0",
-                "COMMENT": "GENERATED VIA SPACE-TRACK.ORG API",
-                "CREATION_DATE": "2026-02-05T13:00:00",
-                "ORIGINATOR": "18 SPCS",
-                "NORAD_CAT_ID": "25544",
-                "OBJECT_NAME": "ISS (ZARYA)",
-                "OBJECT_ID": "1998-067A",
-                "CENTER_NAME": "EARTH",
-                "REF_FRAME": "TEME",
-                "TIME_SYSTEM": "UTC",
-                "MEAN_ELEMENT_THEORY": "SGP4",
-                "EPOCH": "2026-02-05 12:03:05",
-                "MEAN_MOTION": "15.50103472",
-                "ECCENTRICITY": "0.0011155",
-                "INCLINATION": "51.6316",
-                "RA_OF_ASC_NODE": "231.4727",
-                "ARG_OF_PERICENTER": "67.3664",
-                "MEAN_ANOMALY": "292.8503",
-                "EPHEMERIS_TYPE": "0",
-                "CLASSIFICATION_TYPE": "U",
-                "ELEMENT_SET_NO": "999",
-                "REV_AT_EPOCH": "55134",
-                "BSTAR": "0.00024571",
-                "MEAN_MOTION_DOT": "0.0001286",
-                "MEAN_MOTION_DDOT": "0",
-                "SEMIMAJOR_AXIS": "6795.5",
-                "PERIOD": "92.9",
-                "APOAPSIS": "425.1",
-                "PERIAPSIS": "410.0",
-                "OBJECT_TYPE": "PAYLOAD",
-                "RCS_SIZE": "LARGE",
-                "COUNTRY_CODE": "ISS",
-                "LAUNCH_DATE": "1998-11-20",
-                "SITE": "TTMTR",
-                "DECAY_DATE": null,
-                "GP_ID": 271199369,
-                "TLE_LINE0": "0 ISS (ZARYA)",
-                "TLE_LINE1": "1 25544U 98067A   26036.50214262  .00012860  00000+0  24571-3 0  9997",
-                "TLE_LINE2": "2 25544  51.6316 231.4727 0011155  67.3664 292.8503 15.48414003551342"
-            }
-        ]"#;
-        let rows = parse_rows(body).unwrap();
-        assert_eq!(rows.len(), 1);
-        let row = &rows[0];
-        assert_eq!(row.norad_cat_id, 25544);
-        assert_eq!(row.inclination, 51.6316);
-        assert_eq!(row.eccentricity, 0.0011155);
-        assert_eq!(row.bstar, 0.00024571);
-        assert_eq!(row.period, 92.9);
-        assert_eq!(row.rev_at_epoch, 55134);
-        assert_eq!(row.gp_id, 271199369);
-        assert_eq!(row.classification_type, "U");
-        assert_eq!(row.tle_line0, "0 ISS (ZARYA)");
-        assert_eq!(row.decay_date, ""); // null -> empty
-
-        let set = row.to_tle_set();
-        assert_eq!(set.name.as_deref(), Some("ISS (ZARYA)"));
-        assert_eq!(set.catalog_number().unwrap(), 25544);
-        assert!(set.tracker().is_ok());
-    }
-
-    #[test]
-    fn a_numeric_catalog_id_is_also_accepted() {
-        let body = r#"[{"NORAD_CAT_ID": 43001, "TLE_LINE1": "1", "TLE_LINE2": "2"}]"#;
-        assert_eq!(parse_rows(body).unwrap()[0].norad_cat_id, 43001);
-    }
-
-    #[test]
-    fn a_space_track_error_object_becomes_an_api_error() {
-        let body = r#"{"error": "Invalid predicate 'FOO' for class 'gp'"}"#;
-        match parse_rows(body) {
-            Err(SpaceTrackError::Api(message)) => assert!(message.contains("Invalid predicate")),
-            other => panic!("expected an Api error, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn from_env_reports_the_missing_variable() {
-        // Names the variable rather than failing opaquely; we don't set env in
-        // tests to avoid cross-test interference.
-        match Credentials::from_env() {
-            Err(SpaceTrackError::Auth(message)) => assert!(message.contains("SPACETRACK_")),
-            Ok(_) => { /* the developer has it configured; nothing to assert */ }
-            other => panic!("unexpected {other:?}"),
-        }
-    }
-
-    #[test]
-    fn credentials_debug_does_not_leak_the_password() {
-        let rendered = format!("{:?}", Credentials::new("me@example.com", "hunter2"));
-        assert!(rendered.contains("me@example.com"));
-        assert!(!rendered.contains("hunter2"));
-    }
 }

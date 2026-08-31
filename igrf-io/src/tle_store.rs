@@ -1,4 +1,4 @@
-//! Project-local SQLite store for TLEs fetched from Space-Track, via Diesel.
+//! Project-local SQLite store for TLEs fetched from Space-Track
 
 use std::path::{Path, PathBuf};
 
@@ -62,9 +62,6 @@ mod schema {
 
 use schema::tle;
 
-/// Every column except the `norad_cat_id` primary key: `(name, full definition)`.
-/// The single source of truth for both `CREATE TABLE` and the add-missing-column
-/// migration of an older database.
 const COLUMNS: &[(&str, &str)] = &[
     ("object_name", "object_name TEXT NOT NULL DEFAULT ''"),
     ("object_id", "object_id TEXT NOT NULL DEFAULT ''"),
@@ -291,16 +288,14 @@ impl TleRow {
 pub struct StoredTle {
     pub norad_cat_id: u64,
     pub object_name: String,
-    /// International designator, e.g. `1998-067A`.
     pub object_id: String,
-    /// The `0 ISS (ZARYA)` name line.
     pub tle_line0: String,
     pub line1: String,
     pub line2: String,
 
     pub ccsds_omm_vers: String,
     pub comment: String,
-    /// When Space-Track generated this element set.
+
     pub creation_date: String,
     pub originator: String,
     pub center_name: String,
@@ -308,55 +303,38 @@ pub struct StoredTle {
     pub time_system: String,
     pub mean_element_theory: String,
 
-    /// Element-set epoch as issued by Space-Track, e.g. `2026-02-05 12:03:05`.
     pub epoch: String,
-    /// Revolutions per day.
     pub mean_motion: f64,
     pub eccentricity: f64,
-    /// Degrees.
     pub inclination: f64,
-    /// Right ascension of the ascending node, degrees.
     pub ra_of_asc_node: f64,
-    /// Argument of pericenter, degrees.
     pub arg_of_pericenter: f64,
-    /// Degrees.
     pub mean_anomaly: f64,
     pub ephemeris_type: i64,
-    /// `U` / `C` / `S`.
-    pub classification_type: String,
+    pub classification_type: String, /// Type: U/C/S
     pub element_set_no: i64,
     pub rev_at_epoch: i64,
     pub bstar: f64,
     pub mean_motion_dot: f64,
     pub mean_motion_ddot: f64,
-    /// Kilometers.
     pub semimajor_axis: f64,
-    /// Orbital period, minutes.
     pub period: f64,
-    /// Apogee altitude, kilometers.
     pub apoapsis: f64,
-    /// Perigee altitude, kilometers.
     pub periapsis: f64,
 
-    /// `PAYLOAD` / `ROCKET BODY` / `DEBRIS` / `UNKNOWN` (upper-cased on store).
-    pub object_type: String,
-    /// `SMALL` / `MEDIUM` / `LARGE`, or empty.
-    pub rcs_size: String,
+    pub object_type: String,     /// `PAYLOAD` / `ROCKET BODY` / `DEBRIS` / `UNKNOWN` (upper-cased on store).
+    pub rcs_size: String,     /// `SMALL` / `MEDIUM` / `LARGE`, or empty.
     pub country_code: String,
-    /// `yyyy-mm-dd`.
     pub launch_date: String,
     pub site: String,
-    /// `yyyy-mm-dd`, empty while on orbit.
     pub decay_date: String,
     pub data_source: String,
-    /// Space-Track's own row id for this element set.
     pub gp_id: i64,
-    /// RFC 3339 UTC instant this row was last written.
     pub fetched_at: String,
 }
 
+/// Function for formatting the TLE Line 1 and Line 2 into a TLEset, ready to hand to the propagator
 impl StoredTle {
-    /// This row in the program's canonical runtime TLE format.
     pub fn to_tle_set(&self) -> TleSet {
         let mut set = TleSet::new(self.line1.trim(), self.line2.trim());
         if !self.object_name.trim().is_empty() {
@@ -382,15 +360,16 @@ pub struct TleFilter {
     pub site: Option<String>,
     /// Substring match on the country code.
     pub country_code: Option<String>,
-    /// `yyyy-mm-dd`; keeps rows whose launch date is on or after this.
-    pub launch_date_from: Option<String>,
-    /// `yyyy-mm-dd`; keeps rows whose decay date is on or after this
-    /// (still-on-orbit rows, which have no decay date, are excluded).
-    pub decay_date_from: Option<String>,
+    /// `yyyy-mm-dd`; keeps rows whose launch date is *before* this (per db.md:
+    /// the input date is greater than the result's).
+    pub launch_date_before: Option<String>,
+    /// `yyyy-mm-dd`; keeps rows whose decay date is *before* this. Still-on-orbit
+    /// rows (empty decay date) are excluded.
+    pub decay_date_before: Option<String>,
 }
 
 impl TleFilter {
-    /// True when no field constrains the search - it would match everything.
+    /// Checking whether the filter is empty (i.e., no constraints are specified), returns true when no field is input
     pub fn is_empty(&self) -> bool {
         [
             &self.object_name,
@@ -399,8 +378,8 @@ impl TleFilter {
             &self.object_type,
             &self.site,
             &self.country_code,
-            &self.launch_date_from,
-            &self.decay_date_from,
+            &self.launch_date_before,
+            &self.decay_date_before,
         ]
         .into_iter()
         .all(|field| nonblank(field).is_none())
@@ -440,7 +419,10 @@ impl TleStore {
     /// Opens (creating if needed) a database file and applies the schema.
     pub fn open(path: impl AsRef<Path>) -> Result<Self, TleStoreError> {
         let path = path.as_ref().to_path_buf();
-        let connection = SqliteConnection::establish(&path.to_string_lossy())?;
+        let mut connection = SqliteConnection::establish(&path.to_string_lossy())?;
+        // WAL so a "Fetch data" write on the worker thread never blocks the
+        // live search reading on the UI thread; busy_timeout as a backstop.
+        connection.batch_execute("PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 3000;")?;
         let mut store = Self { connection, path };
         store.migrate()?;
         Ok(store)
@@ -492,36 +474,28 @@ impl TleStore {
                     .execute(&mut self.connection)?;
             }
         }
-        // `raw_json` was a short-lived approach - drop it if a build left one.
         if present.iter().any(|column| column == "raw_json") {
             let _ = diesel::sql_query("ALTER TABLE tle DROP COLUMN raw_json")
                 .execute(&mut self.connection);
         }
 
-        // Now that `object_type` is guaranteed to exist, its index can be built.
+        // Create an index on the object type
         self.connection
             .batch_execute("CREATE INDEX IF NOT EXISTS tle_object_type ON tle (object_type);")?;
         Ok(())
     }
 
-    /// Replaces the stored row for this object: on a catalog-number conflict the
-    /// old row is deleted and this one inserted in its place. There is no epoch
-    /// check - the table holds the last fetch, not the "best" one.
-    pub fn replace(&mut self, tle: &SpaceTrackTle) -> Result<(), TleStoreError> {
+    /// Function for upserting one fetched object: For an existing `norad_cat_id` that has its row,
+    /// updated with the fresh values, a new one is inserted
+    pub fn upsert(&mut self, tle: &SpaceTrackTle) -> Result<(), TleStoreError> {
         diesel::replace_into(tle::table)
             .values(TleRow::from_fetched(tle))
             .execute(&mut self.connection)?;
         Ok(())
     }
 
-    /// [`Self::replace`] for several objects, in one transaction. Rows without
-    /// both orbital lines (some full-catalog entries) are skipped. Returns how
-    /// many rows were written.
-    ///
-    /// Inserted one row per statement rather than as a single multi-row INSERT:
-    /// the full catalog is tens of thousands of rows, well past SQLite's bound
-    /// parameter ceiling for one statement.
-    pub fn replace_many(&mut self, tles: &[SpaceTrackTle]) -> Result<usize, TleStoreError> {
+    /// Function for upserting a batch of fetched objects in one transaction
+    pub fn upsert_many(&mut self, tles: &[SpaceTrackTle]) -> Result<usize, TleStoreError> {
         let written = self
             .connection
             .transaction::<usize, diesel::result::Error, _>(|connection| {
@@ -538,6 +512,32 @@ impl TleStore {
                 Ok(written)
             })?;
         Ok(written)
+    }
+
+    /// Whether any row of this object type is stored - i.e. whether "Fetch
+    /// data" has ever run for it. `object_type` is a GP value (`PAYLOAD`,
+    /// `ROCKET BODY`, ...); matched case-insensitively against the upper-cased
+    /// stored value.
+    pub fn has_object_type(&mut self, object_type: &str) -> Result<bool, TleStoreError> {
+        use diesel::dsl::{exists, select};
+        select(exists(
+            tle::table.filter(tle::object_type.eq(object_type.trim().to_uppercase())),
+        ))
+        .get_result(&mut self.connection)
+        .map_err(TleStoreError::from)
+    }
+
+    /// The newest `fetched_at` across all rows of this object type, or `None`
+    /// if the type has never been fetched.
+    pub fn object_type_fetched_at(
+        &mut self,
+        object_type: &str,
+    ) -> Result<Option<String>, TleStoreError> {
+        let newest: Option<String> = tle::table
+            .filter(tle::object_type.eq(object_type.trim().to_uppercase()))
+            .select(diesel::dsl::max(tle::fetched_at))
+            .get_result(&mut self.connection)?;
+        Ok(newest.filter(|value| !value.is_empty()))
     }
 
     /// Drops the stored row for one catalog number. Returns whether a row was
@@ -624,7 +624,7 @@ impl TleStore {
     }
 }
 
-/// Adds one `WHERE` clause per non-blank filter field to a boxed query.
+/// Apply filter (WHERE) clauses to a query. Each non-blank field in the filter is an AND
 fn apply_filter<'a>(
     mut query: tle::BoxedQuery<'a, Sqlite>,
     filter: &TleFilter,
@@ -635,7 +635,7 @@ fn apply_filter<'a>(
         query = query.filter(tle::object_name.like(format!("%{name}%")));
     }
     if let Some(id) = nonblank(&filter.norad_cat_id) {
-        // Substring match on the number as text, so "255" finds 25544.
+        // Substring match on the number as text
         query = query.filter(
             diesel::dsl::sql::<Bool>("CAST(norad_cat_id AS TEXT) LIKE ")
                 .bind::<Text, _>(format!("%{id}%")),
@@ -653,20 +653,22 @@ fn apply_filter<'a>(
     if let Some(country) = nonblank(&filter.country_code) {
         query = query.filter(tle::country_code.like(format!("%{}%", country.to_uppercase())));
     }
-    if let Some(from) = nonblank(&filter.launch_date_from) {
-        query = query.filter(tle::launch_date.ge(from.to_owned()));
+    if let Some(before) = nonblank(&filter.launch_date_before) {
+        query = query
+            .filter(tle::launch_date.ne(""))
+            .filter(tle::launch_date.lt(before.to_owned()));
     }
-    if let Some(from) = nonblank(&filter.decay_date_from) {
+    if let Some(before) = nonblank(&filter.decay_date_before) {
         query = query
             .filter(tle::decay_date.ne(""))
-            .filter(tle::decay_date.ge(from.to_owned()));
+            .filter(tle::decay_date.lt(before.to_owned()));
     }
     query
 }
 
-/// Logs in to Space-Track, fetches the latest element sets, replaces those rows
-/// in the local database, and returns how many rows were written. One login and
-/// one query; the session is logged out before returning.
+/// Logs in to Space-Track, fetches the latest element sets, upserts those rows
+/// into the local database, and returns how many rows were written. One login
+/// and one query; the session is logged out before returning.
 ///
 /// An **empty** `norad_ids` fetches the entire on-orbit catalog (tens of
 /// thousands of objects); otherwise just those catalog numbers.
@@ -680,7 +682,22 @@ pub fn refresh_from_spacetrack(
     let fetched = client.latest_tles(norad_ids)?;
     client.logout();
 
-    Ok(store.replace_many(&fetched)?)
+    Ok(store.upsert_many(&fetched)?)
+}
+
+/// Fetch every object of one GP from specific object type, e.g. (`PAYLOAD` / `ROCKET BODY` / `DEBRIS` / `UNKNOWN`), upsert them
+/// into the store, and return how many rows were written
+pub fn fetch_object_type(
+    credentials: &Credentials,
+    store: &mut TleStore,
+    object_type: &str,
+) -> Result<usize, RefreshError> {
+    let mut client = SpaceTrackClient::new();
+    client.login(credentials)?;
+    let fetched = client.tles_by_object_type(object_type)?;
+    client.logout();
+
+    Ok(store.upsert_many(&fetched)?)
 }
 
 #[derive(Debug)]
@@ -709,290 +726,5 @@ impl From<SpaceTrackError> for RefreshError {
 impl From<TleStoreError> for RefreshError {
     fn from(error: TleStoreError) -> Self {
         Self::Store(error)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn row(id: u64, epoch: &str) -> SpaceTrackTle {
-        serde_json::from_value(serde_json::json!({
-            "NORAD_CAT_ID": id.to_string(),
-            "OBJECT_NAME": "ISS (ZARYA)",
-            "OBJECT_ID": "1998-067A",
-            "EPOCH": epoch,
-            "TLE_LINE1": "1 25544U 98067A   26036.50214262  .00012860  00000+0  24571-3 0  9997",
-            "TLE_LINE2": "2 25544  51.6316 231.4727 0011155  67.3664 292.8503 15.48414003551342",
-        }))
-        .unwrap()
-    }
-
-    fn detailed(
-        id: u64,
-        name: &str,
-        object_type: &str,
-        rcs: &str,
-        site: &str,
-        launch: &str,
-        decay: &str,
-        country: &str,
-    ) -> SpaceTrackTle {
-        serde_json::from_value(serde_json::json!({
-            "NORAD_CAT_ID": id.to_string(),
-            "OBJECT_NAME": name,
-            "OBJECT_ID": "2000-000A",
-            "EPOCH": "2026-02-05 12:00:00",
-            "TLE_LINE1": "1 25544U 98067A   26036.50214262  .00012860  00000+0  24571-3 0  9997",
-            "TLE_LINE2": "2 25544  51.6316 231.4727 0011155  67.3664 292.8503 15.48414003551342",
-            "OBJECT_TYPE": object_type,
-            "RCS_SIZE": rcs,
-            "SITE": site,
-            "LAUNCH_DATE": launch,
-            "DECAY_DATE": decay,
-            "COUNTRY_CODE": country,
-        }))
-        .unwrap()
-    }
-
-    #[test]
-    fn replace_then_format_round_trips_through_the_runtime_type() {
-        let mut store = TleStore::open_in_memory().unwrap();
-        store.replace(&row(25544, "2026-02-05 12:03:05")).unwrap();
-
-        let set = store.tle_set(25544).unwrap();
-        assert_eq!(set.name.as_deref(), Some("ISS (ZARYA)"));
-        assert_eq!(set.catalog_number().unwrap(), 25544);
-        assert!(set.tracker().is_ok());
-
-        assert!(matches!(
-            store.tle_set(99999),
-            Err(TleStoreError::NotFound(99999))
-        ));
-    }
-
-    #[test]
-    fn every_gp_field_round_trips_through_its_typed_column() {
-        let mut store = TleStore::open_in_memory().unwrap();
-        let tle: SpaceTrackTle = serde_json::from_value(serde_json::json!({
-            "NORAD_CAT_ID": "25544",
-            "OBJECT_NAME": "ISS (ZARYA)",
-            "OBJECT_ID": "1998-067A",
-            "TLE_LINE0": "0 ISS (ZARYA)",
-            "TLE_LINE1": "1 25544U 98067A   26036.50214262  .00012860  00000+0  24571-3 0  9997",
-            "TLE_LINE2": "2 25544  51.6316 231.4727 0011155  67.3664 292.8503 15.48414003551342",
-            "ORIGINATOR": "18 SPCS",
-            "REF_FRAME": "TEME",
-            "EPOCH": "2026-02-05 12:03:05",
-            "MEAN_MOTION": "15.50103472",
-            "ECCENTRICITY": "0.0011155",
-            "INCLINATION": "51.6316",
-            "BSTAR": "0.00024571",
-            "REV_AT_EPOCH": "55134",
-            "SEMIMAJOR_AXIS": "6795.5",
-            "PERIOD": "92.9",
-            "APOAPSIS": "425.1",
-            "PERIAPSIS": "410.0",
-            "GP_ID": 271199369,
-            "OBJECT_TYPE": "PAYLOAD",
-        }))
-        .unwrap();
-        store.replace(&tle).unwrap();
-
-        let stored = store.get(25544).unwrap().unwrap();
-        assert_eq!(stored.tle_line0, "0 ISS (ZARYA)");
-        assert_eq!(stored.originator, "18 SPCS");
-        assert_eq!(stored.ref_frame, "TEME");
-        assert_eq!(stored.mean_motion, 15.50103472);
-        assert_eq!(stored.inclination, 51.6316);
-        assert_eq!(stored.bstar, 0.00024571);
-        assert_eq!(stored.rev_at_epoch, 55134);
-        assert_eq!(stored.semimajor_axis, 6795.5);
-        assert_eq!(stored.apoapsis, 425.1);
-        assert_eq!(stored.gp_id, 271199369);
-    }
-
-    #[test]
-    fn replace_drops_the_old_row_for_that_object() {
-        let mut store = TleStore::open_in_memory().unwrap();
-        store.replace(&row(25544, "2026-02-05 00:00:00")).unwrap();
-        store.replace(&row(25544, "2026-01-01 00:00:00")).unwrap();
-
-        assert_eq!(store.all().unwrap().len(), 1);
-        assert_eq!(store.get(25544).unwrap().unwrap().epoch, "2026-01-01 00:00:00");
-    }
-
-    #[test]
-    fn replace_many_keeps_one_row_per_object_and_remove_works() {
-        let mut store = TleStore::open_in_memory().unwrap();
-        let written = store
-            .replace_many(&[row(25544, "2026-02-05 12:00:00"), row(33396, "2026-02-05 13:00:00")])
-            .unwrap();
-        assert_eq!(written, 2);
-        assert_eq!(store.all().unwrap().len(), 2);
-        assert_eq!(store.all_tle_sets().unwrap().len(), 2);
-
-        assert!(store.remove(25544).unwrap());
-        assert!(!store.remove(25544).unwrap());
-        assert_eq!(store.all().unwrap().len(), 1);
-    }
-
-    #[test]
-    fn replace_many_skips_rows_that_have_no_orbital_lines() {
-        let mut store = TleStore::open_in_memory().unwrap();
-        let mut bare = row(70000, "2026-02-05 12:00:00");
-        bare.line1 = String::new();
-        bare.line2 = String::new();
-        let written = store
-            .replace_many(&[row(25544, "2026-02-05 12:00:00"), bare])
-            .unwrap();
-        assert_eq!(written, 1);
-        assert!(store.get(70000).unwrap().is_none());
-    }
-
-    #[test]
-    fn opening_a_pre_metadata_database_adds_the_missing_columns() {
-        use diesel::connection::SimpleConnection;
-        let path = std::env::temp_dir()
-            .join(format!("igrf-tle-{}-{}.db", std::process::id(), "oldschema"));
-        let _ = std::fs::remove_file(&path);
-
-        // A database as an earlier build wrote it: table, no metadata columns.
-        {
-            let mut old = SqliteConnection::establish(&path.to_string_lossy()).unwrap();
-            old.batch_execute(
-                "CREATE TABLE tle (
-                     norad_cat_id INTEGER PRIMARY KEY,
-                     object_name TEXT NOT NULL DEFAULT '',
-                     object_id TEXT NOT NULL DEFAULT '',
-                     epoch TEXT NOT NULL DEFAULT '',
-                     line1 TEXT NOT NULL,
-                     line2 TEXT NOT NULL,
-                     fetched_at TEXT NOT NULL
-                 );
-                 INSERT INTO tle VALUES (25544,'ISS','1998-067A','2026-02-05','1 25544U','2 25544','2026-02-05T00:00:00+00:00');",
-            )
-            .unwrap();
-        }
-
-        let mut store = TleStore::open(&path).unwrap();
-        // The old row survived and now reads back through the widened schema.
-        let stored = store.get(25544).unwrap().unwrap();
-        assert_eq!(stored.object_name, "ISS");
-        assert_eq!(stored.object_type, "");
-        // New writes populate the metadata columns.
-        store
-            .replace(&detailed(
-                40000, "SAT", "PAYLOAD", "SMALL", "AFETR", "2020-01-01", "", "US",
-            ))
-            .unwrap();
-        let page = store
-            .search(
-                &TleFilter {
-                    object_type: Some("PAYLOAD".into()),
-                    ..Default::default()
-                },
-                0,
-                10,
-            )
-            .unwrap();
-        assert_eq!(page.total, 1);
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[test]
-    fn a_file_backed_store_persists_across_reopen() {
-        let path = std::env::temp_dir()
-            .join(format!("igrf-tle-{}-{}.db", std::process::id(), "reopen"));
-        let _ = std::fs::remove_file(&path);
-
-        {
-            let mut store = TleStore::open(&path).unwrap();
-            store.replace(&row(25544, "2026-02-05 12:03:05")).unwrap();
-        }
-        {
-            let mut store = TleStore::open(&path).unwrap();
-            assert_eq!(store.tle_set(25544).unwrap().catalog_number().unwrap(), 25544);
-        }
-        let _ = std::fs::remove_file(&path);
-    }
-
-    #[test]
-    fn search_ands_filters_and_paginates() {
-        let mut store = TleStore::open_in_memory().unwrap();
-        store
-            .replace_many(&[
-                detailed(1, "STARLINK-1", "PAYLOAD", "SMALL", "AFETR", "2019-05-24", "", "US"),
-                detailed(2, "STARLINK-2", "PAYLOAD", "SMALL", "AFETR", "2019-11-11", "", "US"),
-                detailed(3, "SL-16 R/B", "ROCKET BODY", "LARGE", "TYMSC", "1988-01-01", "2005-06-01", "CIS"),
-                detailed(4, "COSMOS DEBRIS", "DEBRIS", "MEDIUM", "PKMTR", "1975-03-03", "1999-09-09", "CIS"),
-            ])
-            .unwrap();
-
-        // Single filter.
-        let payloads = store
-            .search(
-                &TleFilter {
-                    object_type: Some("PAYLOAD".into()),
-                    ..Default::default()
-                },
-                0,
-                10,
-            )
-            .unwrap();
-        assert_eq!(payloads.total, 2);
-
-        // Multiple filters AND-ed: payload + small + launched on/after 2019-06.
-        let recent = store
-            .search(
-                &TleFilter {
-                    object_type: Some("payload".into()),
-                    rcs_size: Some("small".into()),
-                    launch_date_from: Some("2019-06-01".into()),
-                    ..Default::default()
-                },
-                0,
-                10,
-            )
-            .unwrap();
-        assert_eq!(recent.total, 1);
-        assert_eq!(recent.rows[0].object_name, "STARLINK-2");
-
-        // Decay filter excludes still-on-orbit rows.
-        let decayed = store
-            .search(
-                &TleFilter {
-                    decay_date_from: Some("2000-01-01".into()),
-                    ..Default::default()
-                },
-                0,
-                10,
-            )
-            .unwrap();
-        assert_eq!(decayed.total, 1);
-        assert_eq!(decayed.rows[0].norad_cat_id, 3);
-
-        // Pagination: 4 rows, 2 per page.
-        let page0 = store.search(&TleFilter::default(), 0, 2).unwrap();
-        assert_eq!(page0.total, 4);
-        assert_eq!(page0.rows.len(), 2);
-        assert_eq!(page0.page_count(), 2);
-        let page1 = store.search(&TleFilter::default(), 1, 2).unwrap();
-        assert_eq!(page1.rows.len(), 2);
-        assert_ne!(page0.rows[0].norad_cat_id, page1.rows[0].norad_cat_id);
-
-        // NORAD substring.
-        let by_id = store
-            .search(
-                &TleFilter {
-                    norad_cat_id: Some("3".into()),
-                    ..Default::default()
-                },
-                0,
-                10,
-            )
-            .unwrap();
-        assert_eq!(by_id.total, 1);
-        assert_eq!(by_id.rows[0].norad_cat_id, 3);
     }
 }

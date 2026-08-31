@@ -541,7 +541,7 @@ impl IgrfApp {
             profile_path: config.setpoint_profile_path.clone(),
             profile_started: None,
             slew_rate: config.setpoint_slew_nt_per_second.to_string(),
-            manual_magnitude: "0".to_owned(),
+            
             manual_setpoint_error: None,
             raw: [0.0; 3],
             calibrated: [0.0; 3],
@@ -569,8 +569,11 @@ impl IgrfApp {
             paused_by_watchdog: [false; 3],
             resume_pending: false,
             logger: None,
-            manual_lat: "13.7563".to_owned(),
-            manual_lon: "100.5018".to_owned(),
+            
+            // Default lat/lon value in manual magnetism calculator to Chiang Mai, Thailand
+            manual_lat: "18.8524".to_owned(),
+            manual_lon: "98.957478".to_owned(),
+            manual_magnitude: "0".to_owned(),
             manual_result: None,
             manual_error: None,
             map_grid_path: String::new(),
@@ -2686,7 +2689,7 @@ impl IgrfApp {
                     ui.end_row();
                 }
             });
-        if ui.button("Calculate Magnetism WMM2025").clicked() {
+        if ui.button("Calculate Magnetism").clicked() {
             self.calculate_manual_wmm();
         }
         if let Some(error) = &self.manual_error {
@@ -2700,7 +2703,8 @@ impl IgrfApp {
                     for (label, value) in [
                         ("Declination", result.declination),
                         ("Inclination", result.inclination),
-                        ("Intensity", result.total_intensity),
+                        ("Horizontal Intensity", result.horizontal_intensity),
+                        ("Total Intensity", result.total_intensity),
                         ("X", result.x),
                         ("Y", result.y),
                         ("Z", result.z),
@@ -3079,7 +3083,7 @@ impl IgrfApp {
 
         let mut pending_add: Option<StoredTle> = None;
         egui::ScrollArea::vertical()
-            .max_height(260.0)
+            .min_scrolled_height(400.0)
             .id_salt("sat-search-results")
             .show(ui, |ui| {
                 for row in &self.sat_search.results {
@@ -3628,9 +3632,6 @@ impl eframe::App for IgrfApp {
                             egui::CollapsingHeader::new("Config / logging")
                                 .default_open(true)
                                 .show(ui, |ui| self.show_config_panel(ui));
-                            egui::CollapsingHeader::new("Manual WMM2025 calculator")
-                                .default_open(false)
-                                .show(ui, |ui| self.show_manual_panel(ui));
                         });
                     });
                 egui::CentralPanel::default().show(ui, |ui| {
@@ -3660,12 +3661,12 @@ impl eframe::App for IgrfApp {
                             egui::CollapsingHeader::new("Time")
                                 .default_open(true)
                                 .show(ui, |ui| self.show_time_panel(ui));
+                            egui::CollapsingHeader::new("Manual Magnetism Calculator")
+                                .default_open(true)
+                                .show(ui, |ui| self.show_manual_panel(ui));
                             egui::CollapsingHeader::new("Satellite Position")
                                 .default_open(true)
                                 .show(ui, |ui| self.show_satellite_panel(ui));
-                            // egui::CollapsingHeader::new("Manual WMM2025 calculator")
-                            //     .default_open(true)
-                            //     .show(ui, |ui| self.show_manual_panel(ui));
                         });
                     });
                 egui::CentralPanel::default().show(ui, |ui| {

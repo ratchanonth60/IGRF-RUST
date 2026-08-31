@@ -17,7 +17,7 @@ use igrf_core::{
     NOMINAL_TICK_SECONDS,
 };
 use igrf_io::{
-    refresh_from_spacetrack, write_controller_packet, ControllerReplyCounter, Credentials, CsvLogger,
+    fetch_object_type, write_controller_packet, ControllerReplyCounter, Credentials, CsvLogger,
     MagsonSample, MagsonTcpClient, SerialPortManager, SetpointServer, StoredTle, TleFilter, TleStore,
     DEFAULT_BIND_ADDRESS,
 };
@@ -26,9 +26,6 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
 const CONFIG_PATH: &str = "SystemConfig.json";
-/// Project-local SQLite database holding TLEs fetched from Space-Track by
-/// "Update TLE Info". Read offline at startup; written only when the user
-/// fetches.
 const TLE_STORE_PATH: &str = "tle_data.db";
 /// Column-for-column the header the C# build wrote, so existing analysis
 /// scripts keep working against logs from either implementation.
@@ -261,12 +258,13 @@ impl TrackedSat {
     }
 }
 
-/// RCS-size dropdown options; index 0 is "any", the rest map to the stored
+/// RCS-size live-filter options; index 0 is "any", the rest map to the stored
 /// upper-case values.
 const RCS_OPTIONS: [&str; 4] = ["(any)", "Small", "Medium", "Large"];
-/// Object-type dropdown options; index 0 is "any".
-const OBJECT_TYPE_OPTIONS: [(&str, &str); 5] = [
-    ("(any)", ""),
+/// The catalog-search "header": the four fetchable GP object types. `.1` is the
+/// Space-Track `OBJECT_TYPE` value. There is no "any" - a type must be picked
+/// and fetched before the other filters apply (see `db.md`).
+const OBJECT_TYPE_CHOICES: [(&str, &str); 4] = [
     ("Payload", "PAYLOAD"),
     ("Rocket Body", "ROCKET BODY"),
     ("Debris", "DEBRIS"),
@@ -274,46 +272,81 @@ const OBJECT_TYPE_OPTIONS: [(&str, &str); 5] = [
 ];
 const SEARCH_PER_PAGE: usize = 10;
 
-/// "Search catalog" state under the Satellite Position panel: the eight filter
-/// inputs, the filter that was actually searched, and the current result page.
+/// "Search catalog" state under the Satellite Position panel.
 #[derive(Default)]
 struct SatSearchState {
+    /// Index into [`OBJECT_TYPE_CHOICES`] - the header selection.
+    object_type: usize,
+
+    // Live filters over the fetched rows.
     object_name: String,
     norad_cat_id: String,
     rcs_size: usize,
-    object_type: usize,
     site: String,
-    launch_date: String,
-    decay_date: String,
     country_code: String,
+    /// `yyyy-mm-dd`; keeps results launched *before* this.
+    launch_date: String,
+    /// `yyyy-mm-dd`; keeps results decayed *before* this.
+    decay_date: String,
 
-    /// The filter behind `results` - held so paging re-queries the same one
-    /// even if the input fields are edited afterwards.
-    active: TleFilter,
+    /// The running "Fetch data" worker, if any: sends back the row count or an
+    /// error message.
+    fetch_task: Option<Receiver<Result<usize, String>>>,
+    /// GP object-type values that have at least one row stored (so the search
+    /// can apply). Refreshed at startup and after every fetch.
+    fetched_types: Vec<String>,
+
     results: Vec<StoredTle>,
     total: usize,
     page: usize,
     error: Option<String>,
-    searched: bool,
+    last_filter_key: String,
 }
 
 impl SatSearchState {
+    /// The Space-Track `OBJECT_TYPE` value currently selected.
+    fn selected_type(&self) -> &'static str {
+        OBJECT_TYPE_CHOICES[self.object_type].1
+    }
+
+    fn is_selected_type_fetched(&self) -> bool {
+        self.fetched_types
+            .iter()
+            .any(|t| t == self.selected_type())
+    }
+
+    /// The filter for the live search: always scoped to the selected object
+    /// type, plus whichever other fields are filled in.
     fn build_filter(&self) -> TleFilter {
         let text = |value: &str| {
             let trimmed = value.trim();
             (!trimmed.is_empty()).then(|| trimmed.to_owned())
         };
         TleFilter {
+            object_type: Some(self.selected_type().to_owned()),
             object_name: text(&self.object_name),
             norad_cat_id: text(&self.norad_cat_id),
             rcs_size: (self.rcs_size > 0).then(|| RCS_OPTIONS[self.rcs_size].to_uppercase()),
-            object_type: (self.object_type > 0)
-                .then(|| OBJECT_TYPE_OPTIONS[self.object_type].1.to_owned()),
             site: text(&self.site),
             country_code: text(&self.country_code),
-            launch_date_from: text(&self.launch_date),
-            decay_date_from: text(&self.decay_date),
+            launch_date_before: text(&self.launch_date),
+            decay_date_before: text(&self.decay_date),
         }
+    }
+
+    /// Filter key for the search
+    fn filter_key(&self) -> String {
+        format!(
+            "{}|{}|{}|{}|{}|{}|{}|{}",
+            self.object_type,
+            self.object_name.trim(),
+            self.norad_cat_id.trim(),
+            self.rcs_size,
+            self.site.trim(),
+            self.country_code.trim(),
+            self.launch_date.trim(),
+            self.decay_date.trim(),
+        )
     }
 
     fn page_count(&self) -> usize {
@@ -438,14 +471,6 @@ struct IgrfApp {
     station_lon: f64,
     elevation_mask_deg: f64,
     satellite_error: Option<String>,
-    /// "Update TLE Info": a Space-Track fetch of every preset's TLE running off
-    /// the UI thread. The worker sends back how many rows it stored, or a
-    /// message to show.
-    tle_update_task: Option<Receiver<Result<usize, String>>>,
-    /// One-line status under the "add satellite" form: what the last TLE update
-    /// did, or where the draft's elements came from.
-    satellite_tle_note: Option<String>,
-    /// "Search catalog" section: filter inputs, results, current page.
     sat_search: SatSearchState,
 
     active_tab: AppTab,
@@ -572,7 +597,6 @@ impl IgrfApp {
             new_satellite_name: PRESETS[0].name.to_owned(),
             new_tle_line1: PRESETS[0].line1.to_owned(),
             new_tle_line2: PRESETS[0].line2.to_owned(),
-            satellite_tle_note: None,
             sat_search: SatSearchState::default(),
             satellite_tracking: false,
             sim_time_speed: 0,
@@ -582,17 +606,17 @@ impl IgrfApp {
             station_lon: config.station_longitude,
             elevation_mask_deg: config.elevation_mask_deg,
             satellite_error: None,
-            tle_update_task: None,
             active_tab: AppTab::default(),
             status,
             error: config_problem,
             config,
         };
-        // If "Update TLE Info" has run before, tle_data.db holds fresher
+        // If a catalog fetch has run before, tle_data.db may hold fresher
         // elements than the config or the presets - fold them in. Local file
         // read only: nothing fetches at startup.
         app.apply_stored_tles();
         app.fill_draft_from_preset(0);
+        app.refresh_fetched_types();
         app
     }
 
@@ -953,7 +977,7 @@ impl IgrfApp {
 
     fn poll_io(&mut self) {
         self.poll_lan_task();
-        self.poll_tle_update();
+        self.poll_type_fetch();
         self.apply_filter_settings();
         self.apply_calibration();
         self.maybe_reconnect_sensor();
@@ -1832,7 +1856,7 @@ impl IgrfApp {
     }
 
     /// Copies a preset's TLE into the "add satellite" draft fields, preferring
-    /// an element set that "Update TLE Info" saved to `tle_data.db` (matched by
+    /// an element set that a catalog fetch saved to `tle_data.db` (matched by
     /// NORAD catalog number) over the baked-in lines. Local file read only - no
     /// network - so a preset selection always reflects the last fetch.
     fn fill_draft_from_preset(&mut self, index: usize) {
@@ -1887,18 +1911,29 @@ impl IgrfApp {
         refreshed
     }
 
-    /// Runs the "Search catalog" query against `tle_data.db`.
-    fn run_catalog_search(&mut self, reset: bool) {
-        if reset {
-            self.sat_search.active = self.sat_search.build_filter();
-            self.sat_search.page = 0;
-        }
+    /// Reads `tle_data.db` for which object types have rows, so the search knows
+    /// whether the selected type has been fetched. Local read only; a missing DB
+    /// just means "nothing fetched yet".
+    fn refresh_fetched_types(&mut self) {
+        self.sat_search.fetched_types.clear();
         if !std::path::Path::new(TLE_STORE_PATH).exists() {
-            self.sat_search.error =
-                Some("No catalog stored yet - press \"Update TLE Info\" first".to_owned());
+            return;
+        }
+        let Ok(mut store) = TleStore::open(TLE_STORE_PATH) else {
+            return;
+        };
+        for (_, gp_type) in OBJECT_TYPE_CHOICES {
+            if store.has_object_type(gp_type).unwrap_or(false) {
+                self.sat_search.fetched_types.push(gp_type.to_owned());
+            }
+        }
+    }
+
+    /// Function for checking whether the selected type has been fetched, and if so, run the search
+    fn run_catalog_search(&mut self) {
+        if !self.sat_search.is_selected_type_fetched() {
             self.sat_search.results.clear();
             self.sat_search.total = 0;
-            self.sat_search.searched = true;
             return;
         }
         let mut store = match TleStore::open(TLE_STORE_PATH) {
@@ -1908,76 +1943,74 @@ impl IgrfApp {
                 return;
             }
         };
-        match store.search(&self.sat_search.active, self.sat_search.page, SEARCH_PER_PAGE) {
+        let filter = self.sat_search.build_filter();
+        match store.search(&filter, self.sat_search.page, SEARCH_PER_PAGE) {
             Ok(page) => {
-                self.sat_search.results = page.rows;
-                self.sat_search.total = page.total;
+                // A narrowed filter can leave `page` past the end - clamp and
+                // re-query once so the list is never blank with a non-zero total.
+                let last_page = page.total.saturating_sub(1) / SEARCH_PER_PAGE;
+                if page.rows.is_empty() && self.sat_search.page > last_page {
+                    self.sat_search.page = last_page;
+                    let refetched = store
+                        .search(&filter, self.sat_search.page, SEARCH_PER_PAGE)
+                        .unwrap_or(page);
+                    self.sat_search.results = refetched.rows;
+                    self.sat_search.total = refetched.total;
+                } else {
+                    self.sat_search.results = page.rows;
+                    self.sat_search.total = page.total;
+                }
                 self.sat_search.error = None;
-                self.sat_search.searched = true;
             }
             Err(error) => self.sat_search.error = Some(error.to_string()),
         }
     }
 
-    /// "Update TLE Info": fetch the newest TLE for *every* on-orbit object
-    /// Space-Track tracks (tens of thousands) in one request, on a worker
-    /// thread so the UI never blocks. `poll_tle_update` writes them all to
-    /// `tle_data.db` and folds the matches into the tracked list, so any
-    /// satellite selected afterwards is already up to date.
-    fn spawn_tle_update(&mut self) {
-        if self.tle_update_task.is_some() {
+    /// "Fetch data": pull every object of the selected type from Space-Track on
+    /// a worker thread and upsert into `tle_data.db`. `poll_type_fetch` picks up
+    /// the result.
+    fn spawn_type_fetch(&mut self) {
+        if self.sat_search.fetch_task.is_some() {
             return;
         }
+        let gp_type: &'static str = self.sat_search.selected_type();
         let (sender, receiver) = mpsc::channel();
-        self.tle_update_task = Some(receiver);
+        self.sat_search.fetch_task = Some(receiver);
         thread::spawn(move || {
-            let _ = sender.send(update_all_tles());
+            let _ = sender.send(run_type_fetch(gp_type));
         });
-        self.set_status("Fetching the full satellite catalog from Space-Track (may take a minute)...");
+        self.set_status(format!("Fetching {gp_type} from Space-Track..."));
     }
 
-    fn poll_tle_update(&mut self) {
-        let Some(receiver) = &self.tle_update_task else {
+    fn poll_type_fetch(&mut self) {
+        let Some(receiver) = &self.sat_search.fetch_task else {
             return;
         };
         match receiver.try_recv() {
             Ok(result) => {
-                self.tle_update_task = None;
+                self.sat_search.fetch_task = None;
                 match result {
-                    Ok(stored) => {
-                        let refreshed = self.apply_stored_tles();
-                        if let Some(index) = self.new_satellite_preset {
-                            self.fill_draft_from_preset(index);
-                        }
-                        // Trackers were rebuilt underneath a running clock;
-                        // stop so the operator restarts on the fresh elements
-                        // rather than a half-updated pass.
-                        let was_tracking = self.satellite_tracking;
-                        self.satellite_tracking = false;
-                        self.satellite_error = None;
-                        self.satellite_tle_note = Some(format!(
-                            "Saved {stored} TLE(s) to tle_data.db \u{2014} {refreshed} tracked \
-                             satellite(s) refreshed{}",
-                            if was_tracking {
-                                ", press Start tracking"
-                            } else {
-                                ""
-                            }
-                        ));
+                    Ok(count) => {
+                        self.refresh_fetched_types();
+                        self.sat_search.page = 0;
+                        self.sat_search.last_filter_key.clear();
+                        self.sat_search.error = None;
                         self.set_status(format!(
-                            "Space-Track: saved {stored} TLE(s), refreshed {refreshed} tracked"
+                            "Fetched {count} {} object(s) into tle_data.db",
+                            self.sat_search.selected_type()
                         ));
                     }
-                    Err(error) => self.set_error(format!("Space-Track: {error}")),
+                    Err(error) => self.sat_search.error = Some(format!("Space-Track: {error}")),
                 }
             }
             Err(mpsc::TryRecvError::Empty) => {}
             Err(mpsc::TryRecvError::Disconnected) => {
-                self.tle_update_task = None;
-                self.set_error("Space-Track update ended without a result");
+                self.sat_search.fetch_task = None;
+                self.sat_search.error = Some("fetch ended without a result".to_owned());
             }
         }
     }
+
 
     // Get time
     fn simulated_time(&self) -> Option<UtcDateTime> {
@@ -2708,51 +2741,31 @@ impl IgrfApp {
     /// satellite list, the "add satellite" draft fields, the ground station
     /// used for AOS/LOS, and the simulated clock's speed/offset.
     fn show_satellite_panel(&mut self, ui: &mut egui::Ui) {
-        let updating = self.tle_update_task.is_some();
         ui.label(egui::RichText::new("Add satellite").strong());
-        ui.horizontal(|ui| {
-            egui::ComboBox::from_id_salt("satellite-preset")
-                .selected_text(match self.new_satellite_preset {
-                    Some(index) => PRESETS[index].name,
-                    None => "-- Manual --",
-                })
-                .show_ui(ui, |ui| {
+        egui::ComboBox::from_id_salt("satellite-preset")
+            .selected_text(match self.new_satellite_preset {
+                Some(index) => PRESETS[index].name,
+                None => "-- Manual --",
+            })
+            .show_ui(ui, |ui| {
+                if ui
+                    .selectable_label(self.new_satellite_preset.is_none(), "-- Manual --")
+                    .clicked()
+                {
+                    self.new_satellite_preset = None;
+                }
+                for (index, preset) in PRESETS.iter().enumerate() {
                     if ui
-                        .selectable_label(self.new_satellite_preset.is_none(), "-- Manual --")
+                        .selectable_label(self.new_satellite_preset == Some(index), preset.name)
                         .clicked()
                     {
-                        self.new_satellite_preset = None;
+                        self.new_satellite_preset = Some(index);
+                        // Prefers a TLE that a catalog fetch saved to
+                        // `tle_data.db` over the baked-in preset lines.
+                        self.fill_draft_from_preset(index);
                     }
-                    for (index, preset) in PRESETS.iter().enumerate() {
-                        if ui
-                            .selectable_label(self.new_satellite_preset == Some(index), preset.name)
-                            .clicked()
-                        {
-                            self.new_satellite_preset = Some(index);
-                            // Prefers a TLE saved by a previous "Update TLE
-                            // Info" over the baked-in preset lines.
-                            self.fill_draft_from_preset(index);
-                        }
-                    }
-                });
-
-            let button = egui::Button::new(if updating {
-                "Updating\u{2026}"
-            } else {
-                "Update TLE Info"
+                }
             });
-            if ui
-                .add_enabled(!updating, button)
-                .on_hover_text(
-                    "Fetch the full satellite catalog from Space-Track into tle_data.db \
-                     (tens of thousands of objects; needs SPACETRACK_IDENTITY / \
-                     SPACETRACK_PASSWORD in .env). Tracking stops - press Start tracking after.",
-                )
-                .clicked()
-            {
-                self.spawn_tle_update();
-            }
-        });
 
         ui.horizontal(|ui| {
             ui.label("Name");
@@ -2777,15 +2790,12 @@ impl IgrfApp {
         if ui.button("Add satellite").clicked() {
             self.add_satellite();
         }
-        if let Some(note) = &self.satellite_tle_note {
-            ui.label(egui::RichText::new(note).weak().italics());
-        }
 
+        // Search Satellite (Space-Track) section: Full panel in fn:show_catalog_search
         ui.add_space(8.0);
         ui.separator();
-        egui::CollapsingHeader::new("Search catalog")
-            .id_salt("satellite-search")
-            .show(ui, |ui| self.show_catalog_search(ui));
+        ui.label(egui::RichText::new("Search Satellite (Space-Track)").strong());
+        self.show_catalog_search(ui);
 
         ui.add_space(8.0);
         ui.separator();
@@ -2920,18 +2930,72 @@ impl IgrfApp {
         }
     }
 
-    /// Filter the satellite catalog by name, NORAD ID, RCS size, object type, launch site, country code, and launch/decay dates.
+    // Search the Space-Track catalog for satellites, filter, and show search results
     fn show_catalog_search(&mut self, ui: &mut egui::Ui) {
+        let fetching = self.sat_search.fetch_task.is_some();
+
+        ui.horizontal(|ui| {
+            ui.label("Object type");
+            let before = self.sat_search.object_type;
+            egui::ComboBox::from_id_salt("sat-search-type")
+                .selected_text(OBJECT_TYPE_CHOICES[self.sat_search.object_type].0)
+                .show_ui(ui, |ui| {
+                    for (index, (label, _)) in OBJECT_TYPE_CHOICES.iter().enumerate() {
+                        ui.selectable_value(&mut self.sat_search.object_type, index, *label);
+                    }
+                });
+            if self.sat_search.object_type != before {
+                self.sat_search.page = 0;
+            }
+
+            let fetch = egui::Button::new(if fetching {
+                "Fetching\u{2026}"
+            } else {
+                "Fetch data"
+            });
+            if ui
+                .add_enabled(!fetching, fetch)
+                .on_hover_text(
+                    "Fetch every object of this type from Space-Track into tle_data.db",
+                )
+                .clicked()
+            {
+                self.spawn_type_fetch();
+            }
+        });
+
+        if let Some(error) = self.sat_search.error.clone() {
+            ui.colored_label(Color32::LIGHT_RED, error);
+        }
+
+        if !self.sat_search.is_selected_type_fetched() {
+            ui.add_space(4.0);
+            ui.colored_label(Color32::YELLOW, "The data has not been updated");
+            ui.label(
+                egui::RichText::new("Click \"Fetch data\" to download this object type.")
+                    .small()
+                    .weak(),
+            );
+            return;
+        }
+
+        // Search filters over the fetched data
         egui::Grid::new("sat-search-filters")
             .num_columns(2)
             .spacing([8.0, 4.0])
             .show(ui, |ui| {
                 ui.label("Object name");
-                ui.text_edit_singleline(&mut self.sat_search.object_name);
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.sat_search.object_name)
+                        .hint_text("e.g. STARLINK"),
+                );
                 ui.end_row();
 
                 ui.label("NORAD ID");
-                ui.text_edit_singleline(&mut self.sat_search.norad_cat_id);
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.sat_search.norad_cat_id)
+                        .hint_text("e.g. 25544"),
+                );
                 ui.end_row();
 
                 ui.label("RCS size");
@@ -2944,50 +3008,53 @@ impl IgrfApp {
                     });
                 ui.end_row();
 
-                ui.label("Object type");
-                egui::ComboBox::from_id_salt("sat-search-type")
-                    .selected_text(OBJECT_TYPE_OPTIONS[self.sat_search.object_type].0)
-                    .show_ui(ui, |ui| {
-                        for (index, (label, _)) in OBJECT_TYPE_OPTIONS.iter().enumerate() {
-                            ui.selectable_value(&mut self.sat_search.object_type, index, *label);
-                        }
-                    });
-                ui.end_row();
-
                 ui.label("Launch site");
-                ui.text_edit_singleline(&mut self.sat_search.site);
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.sat_search.site)
+                        .hint_text("e.g. Cape Canaveral"),
+                );
                 ui.end_row();
 
                 ui.label("Country code");
-                ui.text_edit_singleline(&mut self.sat_search.country_code);
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.sat_search.country_code)
+                        .hint_text("e.g. USA"),
+                );
                 ui.end_row();
 
-                ui.label("Launch date \u{2265}");
-                ui.text_edit_singleline(&mut self.sat_search.launch_date);
+                ui.label("Launched before");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.sat_search.launch_date)
+                        .hint_text("yyyy-mm-dd"),
+                );
                 ui.end_row();
 
-                ui.label("Decay date \u{2265}");
-                ui.text_edit_singleline(&mut self.sat_search.decay_date);
+                ui.label("Decayed before");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.sat_search.decay_date)
+                        .hint_text("yyyy-mm-dd"),
+                );
                 ui.end_row();
             });
-
-        ui.horizontal(|ui| {
-            if ui.button("Search").clicked() {
-                self.run_catalog_search(true);
-            }
-            if ui.button("Clear").clicked() {
-                self.sat_search = SatSearchState::default();
-            }
-        });
-
-        if let Some(error) = self.sat_search.error.clone() {
-            ui.colored_label(Color32::LIGHT_RED, error);
+        if ui.button("Clear filters").clicked() {
+            self.sat_search.object_name.clear();
+            self.sat_search.norad_cat_id.clear();
+            self.sat_search.rcs_size = 0;
+            self.sat_search.site.clear();
+            self.sat_search.country_code.clear();
+            self.sat_search.launch_date.clear();
+            self.sat_search.decay_date.clear();
         }
 
-        if !self.sat_search.searched {
-            return;
+        // if input key changed (!= last_filter_key), reset the page and re-run the search
+        let key = self.sat_search.filter_key();
+        if key != self.sat_search.last_filter_key {
+            self.sat_search.last_filter_key = key;
+            self.sat_search.page = 0;
+            self.run_catalog_search();
         }
 
+        ui.add_space(4.0);
         let page = self.sat_search.page;
         let page_count = self.sat_search.page_count();
         ui.horizontal(|ui| {
@@ -2999,14 +3066,14 @@ impl IgrfApp {
             ));
             if ui.add_enabled(page > 0, egui::Button::new("\u{2039} Prev")).clicked() {
                 self.sat_search.page -= 1;
-                self.run_catalog_search(false);
+                self.run_catalog_search();
             }
             if ui
                 .add_enabled(page + 1 < page_count, egui::Button::new("Next \u{203a}"))
                 .clicked()
             {
                 self.sat_search.page += 1;
-                self.run_catalog_search(false);
+                self.run_catalog_search();
             }
         });
 
@@ -3018,7 +3085,9 @@ impl IgrfApp {
                 for row in &self.sat_search.results {
                     let add = ui
                         .horizontal(|ui| {
-                            let clicked = ui.small_button("Add").clicked();
+                            let clicked = ui
+                                .small_button("Select")
+                                .clicked();
                             ui.label(format!("{}  #{}", row.object_name, row.norad_cat_id));
                             clicked
                         })
@@ -3049,12 +3118,15 @@ impl IgrfApp {
             if row.line1.trim().is_empty() || row.line2.trim().is_empty() {
                 self.set_error(format!("{} has no TLE lines stored", row.object_name));
             } else {
-                self.tracked_satellites.push(TrackedSat::new(
-                    row.object_name.clone(),
-                    row.line1,
-                    row.line2,
+                // Load the result to see the TLE lines before Add satellite
+                self.new_satellite_preset = None;
+                self.new_satellite_name = row.object_name.clone();
+                self.new_tle_line1 = row.line1;
+                self.new_tle_line2 = row.line2;
+                self.set_status(format!(
+                    "{} loaded into \"Add satellite\" \u{2014} press \"Add satellite\" to track it",
+                    row.object_name
                 ));
-                self.set_status(format!("Added {} to the tracked list", row.object_name));
             }
         }
     }
@@ -3198,8 +3270,6 @@ impl IgrfApp {
                 }
             });
 
-            // `ProcessedData` carries |error| for C# parity, which cannot tell
-            // overshoot from undershoot; recompute the signed value for display.
             let error = self.pid_settings[axis].setpoint - self.filtered[axis];
             let error_percent = [
                 self.processed.error_per_x,
@@ -3666,16 +3736,14 @@ fn dash_if_blank(value: &str) -> &str {
     }
 }
 
-/// Worker body for "Update TLE Info": log in to Space-Track with the
-/// `SPACETRACK_IDENTITY` / `SPACETRACK_PASSWORD` variables (from `.env`), fetch
-/// the newest element set for the *entire* on-orbit catalog in one request, and
-/// write every row into `tle_data.db`. Returns how many rows were stored. Every
-/// failure is flattened to a message the panel can show.
-fn update_all_tles() -> Result<usize, String> {
+/// Worker body for the catalog search's "Fetch data": log in to Space-Track,
+/// fetch every object of `gp_type` (`PAYLOAD` / `ROCKET BODY` / ...), and upsert
+/// them into `tle_data.db`. Returns the row count; failures are flattened to a
+/// message the panel can show.
+fn run_type_fetch(gp_type: &str) -> Result<usize, String> {
     let credentials = Credentials::from_env().map_err(|error| error.to_string())?;
     let mut store = TleStore::open(TLE_STORE_PATH).map_err(|error| error.to_string())?;
-    // Empty id slice = the whole catalog.
-    refresh_from_spacetrack(&credentials, &mut store, &[]).map_err(|error| error.to_string())
+    fetch_object_type(&credentials, &mut store, gp_type).map_err(|error| error.to_string())
 }
 
 /// An open port that stopped delivering packets leaves the last reading in

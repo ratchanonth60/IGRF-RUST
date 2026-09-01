@@ -18,8 +18,8 @@ use igrf_core::{
 };
 use igrf_io::{
     fetch_object_type, write_controller_packet, ControllerReplyCounter, Credentials, CsvLogger,
-    MagsonSample, MagsonTcpClient, SerialPortManager, SetpointServer, StoredTle, TleFilter, TleStore,
-    DEFAULT_BIND_ADDRESS,
+    MagsonSample, MagsonTcpClient, SerialPortManager, SetpointServer, StoredTle, TleFilter,
+    TleStore, DEFAULT_BIND_ADDRESS,
 };
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
@@ -310,9 +310,7 @@ impl SatSearchState {
     }
 
     fn is_selected_type_fetched(&self) -> bool {
-        self.fetched_types
-            .iter()
-            .any(|t| t == self.selected_type())
+        self.fetched_types.iter().any(|t| t == self.selected_type())
     }
 
     /// The filter for the live search: always scoped to the selected object
@@ -541,7 +539,7 @@ impl IgrfApp {
             profile_path: config.setpoint_profile_path.clone(),
             profile_started: None,
             slew_rate: config.setpoint_slew_nt_per_second.to_string(),
-            
+
             manual_setpoint_error: None,
             raw: [0.0; 3],
             calibrated: [0.0; 3],
@@ -569,7 +567,7 @@ impl IgrfApp {
             paused_by_watchdog: [false; 3],
             resume_pending: false,
             logger: None,
-            
+
             // Default lat/lon value in manual magnetism calculator to Chiang Mai, Thailand
             manual_lat: "18.8524".to_owned(),
             manual_lon: "98.957478".to_owned(),
@@ -1866,7 +1864,12 @@ impl IgrfApp {
         let Some(preset) = PRESETS.get(index).copied() else {
             return;
         };
-        match preset.to_tle_set().catalog_number().ok().and_then(stored_tle) {
+        match preset
+            .to_tle_set()
+            .catalog_number()
+            .ok()
+            .and_then(stored_tle)
+        {
             Some(stored) => {
                 self.new_satellite_name = if stored.object_name.trim().is_empty() {
                     preset.name.to_owned()
@@ -1903,9 +1906,7 @@ impl IgrfApp {
             let Ok(Some(stored)) = store.get(catalog) else {
                 continue;
             };
-            if stored.line1.trim() == sat.line1.trim()
-                && stored.line2.trim() == sat.line2.trim()
-            {
+            if stored.line1.trim() == sat.line1.trim() && stored.line2.trim() == sat.line2.trim() {
                 continue;
             }
             *sat = TrackedSat::new(sat.name.clone(), stored.line1, stored.line2);
@@ -2013,7 +2014,6 @@ impl IgrfApp {
             }
         }
     }
-
 
     // Get time
     fn simulated_time(&self) -> Option<UtcDateTime> {
@@ -2959,9 +2959,7 @@ impl IgrfApp {
             });
             if ui
                 .add_enabled(!fetching, fetch)
-                .on_hover_text(
-                    "Fetch every object of this type from Space-Track into tle_data.db",
-                )
+                .on_hover_text("Fetch every object of this type from Space-Track into tle_data.db")
                 .clicked()
             {
                 self.spawn_type_fetch();
@@ -3068,7 +3066,10 @@ impl IgrfApp {
                 page + 1,
                 page_count
             ));
-            if ui.add_enabled(page > 0, egui::Button::new("\u{2039} Prev")).clicked() {
+            if ui
+                .add_enabled(page > 0, egui::Button::new("\u{2039} Prev"))
+                .clicked()
+            {
                 self.sat_search.page -= 1;
                 self.run_catalog_search();
             }
@@ -3089,9 +3090,7 @@ impl IgrfApp {
                 for row in &self.sat_search.results {
                     let add = ui
                         .horizontal(|ui| {
-                            let clicked = ui
-                                .small_button("Select")
-                                .clicked();
+                            let clicked = ui.small_button("Select").clicked();
                             ui.label(format!("{}  #{}", row.object_name, row.norad_cat_id));
                             clicked
                         })

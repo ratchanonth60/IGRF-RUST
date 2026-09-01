@@ -239,12 +239,94 @@ pub fn split_dateline_segments(track: &[SatellitePosition]) -> Vec<Vec<[f64; 2]>
     segments
 }
 
+/// An owned three-line element set: the program's canonical runtime TLE format.
+///
+/// A [`SatellitePreset`] is the same data with `'static` strings baked into the
+/// binary. A TLE that arrives at runtime - fetched from Space-Track, read from a
+/// file, typed into the UI - is turned into one of these before it can be
+/// propagated, so every downstream consumer sees a single shape regardless of
+/// where the elements came from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TleSet {
+    /// Object name for display. `None` when the source gave only the two
+    /// orbital lines.
+    pub name: Option<String>,
+    /// Line 1 of the TLE, exactly as issued (69 columns, checksum included).
+    pub line1: String,
+    /// Line 2 of the TLE, exactly as issued.
+    pub line2: String,
+}
+
+impl TleSet {
+    /// A set with no object name.
+    pub fn new(line1: impl Into<String>, line2: impl Into<String>) -> Self {
+        Self {
+            name: None,
+            line1: line1.into(),
+            line2: line2.into(),
+        }
+    }
+
+    /// A named set.
+    pub fn named(
+        name: impl Into<String>,
+        line1: impl Into<String>,
+        line2: impl Into<String>,
+    ) -> Self {
+        Self {
+            name: Some(name.into()),
+            line1: line1.into(),
+            line2: line2.into(),
+        }
+    }
+
+    /// Attaches (or replaces) the object name.
+    pub fn with_name(mut self, name: impl Into<String>) -> Self {
+        self.name = Some(name.into());
+        self
+    }
+
+    /// NORAD catalog number carried in field 2 of line 1 (for example the
+    /// `25544` in `1 25544U 98067A ...`). The trailing classification letter is
+    /// stripped before parsing.
+    pub fn catalog_number(&self) -> Result<u64, SatelliteError> {
+        let token = self
+            .line1
+            .split_whitespace()
+            .nth(1)
+            .ok_or_else(|| SatelliteError::Tle("line 1 has no catalog-number field".to_owned()))?;
+        token
+            .trim_end_matches(|character: char| !character.is_ascii_digit())
+            .parse()
+            .map_err(|_| SatelliteError::Tle(format!("`{token}` is not a catalog number")))
+    }
+
+    /// Parses and validates the elements, returning a tracker ready to
+    /// propagate. This is the single point where a runtime TLE enters SGP4.
+    pub fn tracker(&self) -> Result<SatelliteTracker, SatelliteError> {
+        SatelliteTracker::from_tle(self.name.as_deref(), &self.line1, &self.line2)
+    }
+}
+
+impl From<SatellitePreset> for TleSet {
+    fn from(preset: SatellitePreset) -> Self {
+        Self::named(preset.name, preset.line1, preset.line2)
+    }
+}
+
 /// The satellite presets
 #[derive(Debug, Clone, Copy)]
 pub struct SatellitePreset {
     pub name: &'static str,
     pub line1: &'static str,
     pub line2: &'static str,
+}
+
+impl SatellitePreset {
+    /// This preset as an owned [`TleSet`].
+    pub fn to_tle_set(&self) -> TleSet {
+        TleSet::named(self.name, self.line1, self.line2)
+    }
 }
 
 pub const PRESETS: &[SatellitePreset] = &[
@@ -307,10 +389,7 @@ mod tests {
     #[test]
     fn iss_orbital_period_is_about_93_minutes() {
         let period = iss_tracker().orbital_period_minutes();
-        assert!(
-            (period - 93.0).abs() < 1.0,
-            "expected ~93 min, got {period}"
-        );
+        assert!((period - 93.0).abs() < 1.0, "expected ~93 min, got {period}");
     }
 
     #[test]

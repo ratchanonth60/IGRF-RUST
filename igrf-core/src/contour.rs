@@ -92,10 +92,17 @@ fn push_cell_segments(
     let left = [x0, lerp(y0, y1, v00, v01)];
 
     let high = |v: f64| v >= level;
-    let case = high(v00) as u8 | (high(v10) as u8) << 1 | (high(v11) as u8) << 2 | (high(v01) as u8) << 3;
+    let case =
+        high(v00) as u8 | (high(v10) as u8) << 1 | (high(v11) as u8) << 2 | (high(v01) as u8) << 3;
     let center_high = high((v00 + v10 + v11 + v01) / 4.0);
 
-    let mut push = |a: [f64; 2], b: [f64; 2]| segments.push(ContourSegment { level, start: a, end: b });
+    let mut push = |a: [f64; 2], b: [f64; 2]| {
+        segments.push(ContourSegment {
+            level,
+            start: a,
+            end: b,
+        })
+    };
 
     match case {
         0 | 15 => {}

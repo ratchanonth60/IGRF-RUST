@@ -8,7 +8,7 @@ use igrf_core::geomagnetism::{
     Coordinate, GeomagnetismCalculator, GeomagnetismResult, UtcDateTime,
 };
 use igrf_core::satellite::{
-    elevation_deg, split_dateline_segments, SatellitePosition, SatelliteTracker, PRESETS,
+    elevation_deg, split_dateline_segments, SatellitePosition, SatelliteTracker, TleSet, PRESETS,
 };
 use igrf_core::{
     contour_segments, field_from_magnitude, AppConfig, CalculationService, CalibrationSettings,
@@ -17,14 +17,16 @@ use igrf_core::{
     NOMINAL_TICK_SECONDS,
 };
 use igrf_io::{
-    write_controller_packet, ControllerReplyCounter, CsvLogger, MagsonSample, MagsonTcpClient,
-    SerialPortManager, SetpointServer, DEFAULT_BIND_ADDRESS,
+    fetch_object_type, write_controller_packet, ControllerReplyCounter, Credentials, CsvLogger,
+    MagsonSample, MagsonTcpClient, SerialPortManager, SetpointServer, StoredTle, TleFilter,
+    TleStore, DEFAULT_BIND_ADDRESS,
 };
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
 
 const CONFIG_PATH: &str = "SystemConfig.json";
+const TLE_STORE_PATH: &str = "tle_data.db";
 /// Column-for-column the header the C# build wrote, so existing analysis
 /// scripts keep working against logs from either implementation.
 /// The C# columns, in the C# order, plus the four this build adds at the end:
@@ -90,6 +92,11 @@ const SATELLITE_COLORS: [Color32; 6] = [
 ];
 
 fn main() -> eframe::Result {
+    // Load `.env` from the working directory (or any parent) into the process
+    // environment before anything reads it. Missing file is fine - real
+    // environment variables still work, and so does an app that never fetches.
+    let _ = dotenvy::dotenv();
+
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1600.0, 1000.0])
@@ -251,6 +258,100 @@ impl TrackedSat {
     }
 }
 
+/// RCS-size live-filter options; index 0 is "any", the rest map to the stored
+/// upper-case values.
+const RCS_OPTIONS: [&str; 4] = ["(any)", "Small", "Medium", "Large"];
+/// The catalog-search "header": the four fetchable GP object types. `.1` is the
+/// Space-Track `OBJECT_TYPE` value. There is no "any" - a type must be picked
+/// and fetched before the other filters apply (see `db.md`).
+const OBJECT_TYPE_CHOICES: [(&str, &str); 4] = [
+    ("Payload", "PAYLOAD"),
+    ("Rocket Body", "ROCKET BODY"),
+    ("Debris", "DEBRIS"),
+    ("Unknown", "UNKNOWN"),
+];
+const SEARCH_PER_PAGE: usize = 10;
+
+/// "Search catalog" state under the Satellite Position panel.
+#[derive(Default)]
+struct SatSearchState {
+    /// Index into [`OBJECT_TYPE_CHOICES`] - the header selection.
+    object_type: usize,
+
+    // Live filters over the fetched rows.
+    object_name: String,
+    norad_cat_id: String,
+    rcs_size: usize,
+    site: String,
+    country_code: String,
+    /// `yyyy-mm-dd`; keeps results launched *before* this.
+    launch_date: String,
+    /// `yyyy-mm-dd`; keeps results decayed *before* this.
+    decay_date: String,
+
+    /// The running "Fetch data" worker, if any: sends back the row count or an
+    /// error message.
+    fetch_task: Option<Receiver<Result<usize, String>>>,
+    /// GP object-type values that have at least one row stored (so the search
+    /// can apply). Refreshed at startup and after every fetch.
+    fetched_types: Vec<String>,
+
+    results: Vec<StoredTle>,
+    total: usize,
+    page: usize,
+    error: Option<String>,
+    last_filter_key: String,
+}
+
+impl SatSearchState {
+    /// The Space-Track `OBJECT_TYPE` value currently selected.
+    fn selected_type(&self) -> &'static str {
+        OBJECT_TYPE_CHOICES[self.object_type].1
+    }
+
+    fn is_selected_type_fetched(&self) -> bool {
+        self.fetched_types.iter().any(|t| t == self.selected_type())
+    }
+
+    /// The filter for the live search: always scoped to the selected object
+    /// type, plus whichever other fields are filled in.
+    fn build_filter(&self) -> TleFilter {
+        let text = |value: &str| {
+            let trimmed = value.trim();
+            (!trimmed.is_empty()).then(|| trimmed.to_owned())
+        };
+        TleFilter {
+            object_type: Some(self.selected_type().to_owned()),
+            object_name: text(&self.object_name),
+            norad_cat_id: text(&self.norad_cat_id),
+            rcs_size: (self.rcs_size > 0).then(|| RCS_OPTIONS[self.rcs_size].to_uppercase()),
+            site: text(&self.site),
+            country_code: text(&self.country_code),
+            launch_date_before: text(&self.launch_date),
+            decay_date_before: text(&self.decay_date),
+        }
+    }
+
+    /// Filter key for the search
+    fn filter_key(&self) -> String {
+        format!(
+            "{}|{}|{}|{}|{}|{}|{}|{}",
+            self.object_type,
+            self.object_name.trim(),
+            self.norad_cat_id.trim(),
+            self.rcs_size,
+            self.site.trim(),
+            self.country_code.trim(),
+            self.launch_date.trim(),
+            self.decay_date.trim(),
+        )
+    }
+
+    fn page_count(&self) -> usize {
+        self.total.div_ceil(SEARCH_PER_PAGE).max(1)
+    }
+}
+
 struct IgrfApp {
     config: AppConfig,
     sensor_port: String,
@@ -368,6 +469,7 @@ struct IgrfApp {
     station_lon: f64,
     elevation_mask_deg: f64,
     satellite_error: Option<String>,
+    sat_search: SatSearchState,
 
     active_tab: AppTab,
     status: String,
@@ -394,7 +496,7 @@ impl IgrfApp {
             Err(error) => (Vec::new(), format!("Port scan unavailable: {error}")),
         };
 
-        Self {
+        let mut app = Self {
             sensor_port: config.sensor_port.clone(),
             sensor_baud: config.sensor_baud.to_string(),
             controller_port: config.controller_port.clone(),
@@ -437,7 +539,7 @@ impl IgrfApp {
             profile_path: config.setpoint_profile_path.clone(),
             profile_started: None,
             slew_rate: config.setpoint_slew_nt_per_second.to_string(),
-            manual_magnitude: "0".to_owned(),
+
             manual_setpoint_error: None,
             raw: [0.0; 3],
             calibrated: [0.0; 3],
@@ -465,8 +567,11 @@ impl IgrfApp {
             paused_by_watchdog: [false; 3],
             resume_pending: false,
             logger: None,
-            manual_lat: "13.7563".to_owned(),
-            manual_lon: "100.5018".to_owned(),
+
+            // Default lat/lon value in manual magnetism calculator to Chiang Mai, Thailand
+            manual_lat: "18.8524".to_owned(),
+            manual_lon: "98.957478".to_owned(),
+            manual_magnitude: "0".to_owned(),
             manual_result: None,
             manual_error: None,
             map_grid_path: String::new(),
@@ -493,6 +598,7 @@ impl IgrfApp {
             new_satellite_name: PRESETS[0].name.to_owned(),
             new_tle_line1: PRESETS[0].line1.to_owned(),
             new_tle_line2: PRESETS[0].line2.to_owned(),
+            sat_search: SatSearchState::default(),
             satellite_tracking: false,
             sim_time_speed: 0,
             sim_time_offset_s: 0.0,
@@ -505,7 +611,14 @@ impl IgrfApp {
             status,
             error: config_problem,
             config,
-        }
+        };
+        // If a catalog fetch has run before, tle_data.db may hold fresher
+        // elements than the config or the presets - fold them in. Local file
+        // read only: nothing fetches at startup.
+        app.apply_stored_tles();
+        app.fill_draft_from_preset(0);
+        app.refresh_fetched_types();
+        app
     }
 
     fn set_status(&mut self, message: impl Into<String>) {
@@ -865,6 +978,7 @@ impl IgrfApp {
 
     fn poll_io(&mut self) {
         self.poll_lan_task();
+        self.poll_type_fetch();
         self.apply_filter_settings();
         self.apply_calibration();
         self.maybe_reconnect_sensor();
@@ -1742,6 +1856,165 @@ impl IgrfApp {
         self.satellite_tracking = false;
     }
 
+    /// Copies a preset's TLE into the "add satellite" draft fields, preferring
+    /// an element set that a catalog fetch saved to `tle_data.db` (matched by
+    /// NORAD catalog number) over the baked-in lines. Local file read only - no
+    /// network - so a preset selection always reflects the last fetch.
+    fn fill_draft_from_preset(&mut self, index: usize) {
+        let Some(preset) = PRESETS.get(index).copied() else {
+            return;
+        };
+        match preset
+            .to_tle_set()
+            .catalog_number()
+            .ok()
+            .and_then(stored_tle)
+        {
+            Some(stored) => {
+                self.new_satellite_name = if stored.object_name.trim().is_empty() {
+                    preset.name.to_owned()
+                } else {
+                    stored.object_name
+                };
+                self.new_tle_line1 = stored.line1;
+                self.new_tle_line2 = stored.line2;
+            }
+            None => {
+                self.new_satellite_name = preset.name.to_owned();
+                self.new_tle_line1 = preset.line1.to_owned();
+                self.new_tle_line2 = preset.line2.to_owned();
+            }
+        }
+    }
+
+    /// Rebuilds every tracked satellite whose NORAD catalog number has a
+    /// different element set in `tle_data.db`. Returns how many were refreshed.
+    /// Never creates the database, and leaves tracking as it found it - callers
+    /// stop it so the operator restarts on the fresh elements.
+    fn apply_stored_tles(&mut self) -> usize {
+        if !std::path::Path::new(TLE_STORE_PATH).exists() {
+            return 0;
+        }
+        let Ok(mut store) = TleStore::open(TLE_STORE_PATH) else {
+            return 0;
+        };
+        let mut refreshed = 0;
+        for sat in &mut self.tracked_satellites {
+            let Some(catalog) = catalog_of(&sat.line1) else {
+                continue;
+            };
+            let Ok(Some(stored)) = store.get(catalog) else {
+                continue;
+            };
+            if stored.line1.trim() == sat.line1.trim() && stored.line2.trim() == sat.line2.trim() {
+                continue;
+            }
+            *sat = TrackedSat::new(sat.name.clone(), stored.line1, stored.line2);
+            refreshed += 1;
+        }
+        refreshed
+    }
+
+    /// Reads `tle_data.db` for which object types have rows, so the search knows
+    /// whether the selected type has been fetched. Local read only; a missing DB
+    /// just means "nothing fetched yet".
+    fn refresh_fetched_types(&mut self) {
+        self.sat_search.fetched_types.clear();
+        if !std::path::Path::new(TLE_STORE_PATH).exists() {
+            return;
+        }
+        let Ok(mut store) = TleStore::open(TLE_STORE_PATH) else {
+            return;
+        };
+        for (_, gp_type) in OBJECT_TYPE_CHOICES {
+            if store.has_object_type(gp_type).unwrap_or(false) {
+                self.sat_search.fetched_types.push(gp_type.to_owned());
+            }
+        }
+    }
+
+    /// Function for checking whether the selected type has been fetched, and if so, run the search
+    fn run_catalog_search(&mut self) {
+        if !self.sat_search.is_selected_type_fetched() {
+            self.sat_search.results.clear();
+            self.sat_search.total = 0;
+            return;
+        }
+        let mut store = match TleStore::open(TLE_STORE_PATH) {
+            Ok(store) => store,
+            Err(error) => {
+                self.sat_search.error = Some(error.to_string());
+                return;
+            }
+        };
+        let filter = self.sat_search.build_filter();
+        match store.search(&filter, self.sat_search.page, SEARCH_PER_PAGE) {
+            Ok(page) => {
+                // A narrowed filter can leave `page` past the end - clamp and
+                // re-query once so the list is never blank with a non-zero total.
+                let last_page = page.total.saturating_sub(1) / SEARCH_PER_PAGE;
+                if page.rows.is_empty() && self.sat_search.page > last_page {
+                    self.sat_search.page = last_page;
+                    let refetched = store
+                        .search(&filter, self.sat_search.page, SEARCH_PER_PAGE)
+                        .unwrap_or(page);
+                    self.sat_search.results = refetched.rows;
+                    self.sat_search.total = refetched.total;
+                } else {
+                    self.sat_search.results = page.rows;
+                    self.sat_search.total = page.total;
+                }
+                self.sat_search.error = None;
+            }
+            Err(error) => self.sat_search.error = Some(error.to_string()),
+        }
+    }
+
+    /// "Fetch data": pull every object of the selected type from Space-Track on
+    /// a worker thread and upsert into `tle_data.db`. `poll_type_fetch` picks up
+    /// the result.
+    fn spawn_type_fetch(&mut self) {
+        if self.sat_search.fetch_task.is_some() {
+            return;
+        }
+        let gp_type: &'static str = self.sat_search.selected_type();
+        let (sender, receiver) = mpsc::channel();
+        self.sat_search.fetch_task = Some(receiver);
+        thread::spawn(move || {
+            let _ = sender.send(run_type_fetch(gp_type));
+        });
+        self.set_status(format!("Fetching {gp_type} from Space-Track..."));
+    }
+
+    fn poll_type_fetch(&mut self) {
+        let Some(receiver) = &self.sat_search.fetch_task else {
+            return;
+        };
+        match receiver.try_recv() {
+            Ok(result) => {
+                self.sat_search.fetch_task = None;
+                match result {
+                    Ok(count) => {
+                        self.refresh_fetched_types();
+                        self.sat_search.page = 0;
+                        self.sat_search.last_filter_key.clear();
+                        self.sat_search.error = None;
+                        self.set_status(format!(
+                            "Fetched {count} {} object(s) into tle_data.db",
+                            self.sat_search.selected_type()
+                        ));
+                    }
+                    Err(error) => self.sat_search.error = Some(format!("Space-Track: {error}")),
+                }
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.sat_search.fetch_task = None;
+                self.sat_search.error = Some("fetch ended without a result".to_owned());
+            }
+        }
+    }
+
     // Get time
     fn simulated_time(&self) -> Option<UtcDateTime> {
         let offset =
@@ -2416,7 +2689,7 @@ impl IgrfApp {
                     ui.end_row();
                 }
             });
-        if ui.button("Calculate Magnetism WMM2025").clicked() {
+        if ui.button("Calculate Magnetism").clicked() {
             self.calculate_manual_wmm();
         }
         if let Some(error) = &self.manual_error {
@@ -2430,7 +2703,8 @@ impl IgrfApp {
                     for (label, value) in [
                         ("Declination", result.declination),
                         ("Inclination", result.inclination),
-                        ("Intensity", result.total_intensity),
+                        ("Horizontal Intensity", result.horizontal_intensity),
+                        ("Total Intensity", result.total_intensity),
                         ("X", result.x),
                         ("Y", result.y),
                         ("Z", result.z),
@@ -2490,9 +2764,9 @@ impl IgrfApp {
                         .clicked()
                     {
                         self.new_satellite_preset = Some(index);
-                        self.new_satellite_name = preset.name.to_owned();
-                        self.new_tle_line1 = preset.line1.to_owned();
-                        self.new_tle_line2 = preset.line2.to_owned();
+                        // Prefers a TLE that a catalog fetch saved to
+                        // `tle_data.db` over the baked-in preset lines.
+                        self.fill_draft_from_preset(index);
                     }
                 }
             });
@@ -2520,6 +2794,12 @@ impl IgrfApp {
         if ui.button("Add satellite").clicked() {
             self.add_satellite();
         }
+
+        // Search Satellite (Space-Track) section: Full panel in fn:show_catalog_search
+        ui.add_space(8.0);
+        ui.separator();
+        ui.label(egui::RichText::new("Search Satellite (Space-Track)").strong());
+        self.show_catalog_search(ui);
 
         ui.add_space(8.0);
         ui.separator();
@@ -2651,6 +2931,206 @@ impl IgrfApp {
         }
         if let Some(index) = to_remove {
             self.remove_satellite(index);
+        }
+    }
+
+    // Search the Space-Track catalog for satellites, filter, and show search results
+    fn show_catalog_search(&mut self, ui: &mut egui::Ui) {
+        let fetching = self.sat_search.fetch_task.is_some();
+
+        ui.horizontal(|ui| {
+            ui.label("Object type");
+            let before = self.sat_search.object_type;
+            egui::ComboBox::from_id_salt("sat-search-type")
+                .selected_text(OBJECT_TYPE_CHOICES[self.sat_search.object_type].0)
+                .show_ui(ui, |ui| {
+                    for (index, (label, _)) in OBJECT_TYPE_CHOICES.iter().enumerate() {
+                        ui.selectable_value(&mut self.sat_search.object_type, index, *label);
+                    }
+                });
+            if self.sat_search.object_type != before {
+                self.sat_search.page = 0;
+            }
+
+            let fetch = egui::Button::new(if fetching {
+                "Fetching\u{2026}"
+            } else {
+                "Fetch data"
+            });
+            if ui
+                .add_enabled(!fetching, fetch)
+                .on_hover_text("Fetch every object of this type from Space-Track into tle_data.db")
+                .clicked()
+            {
+                self.spawn_type_fetch();
+            }
+        });
+
+        if let Some(error) = self.sat_search.error.clone() {
+            ui.colored_label(Color32::LIGHT_RED, error);
+        }
+
+        if !self.sat_search.is_selected_type_fetched() {
+            ui.add_space(4.0);
+            ui.colored_label(Color32::YELLOW, "The data has not been updated");
+            ui.label(
+                egui::RichText::new("Click \"Fetch data\" to download this object type.")
+                    .small()
+                    .weak(),
+            );
+            return;
+        }
+
+        // Search filters over the fetched data
+        egui::Grid::new("sat-search-filters")
+            .num_columns(2)
+            .spacing([8.0, 4.0])
+            .show(ui, |ui| {
+                ui.label("Object name");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.sat_search.object_name)
+                        .hint_text("e.g. STARLINK"),
+                );
+                ui.end_row();
+
+                ui.label("NORAD ID");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.sat_search.norad_cat_id)
+                        .hint_text("e.g. 25544"),
+                );
+                ui.end_row();
+
+                ui.label("RCS size");
+                egui::ComboBox::from_id_salt("sat-search-rcs")
+                    .selected_text(RCS_OPTIONS[self.sat_search.rcs_size])
+                    .show_ui(ui, |ui| {
+                        for (index, label) in RCS_OPTIONS.iter().enumerate() {
+                            ui.selectable_value(&mut self.sat_search.rcs_size, index, *label);
+                        }
+                    });
+                ui.end_row();
+
+                ui.label("Launch site");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.sat_search.site)
+                        .hint_text("e.g. Cape Canaveral"),
+                );
+                ui.end_row();
+
+                ui.label("Country code");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.sat_search.country_code)
+                        .hint_text("e.g. USA"),
+                );
+                ui.end_row();
+
+                ui.label("Launched before");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.sat_search.launch_date)
+                        .hint_text("yyyy-mm-dd"),
+                );
+                ui.end_row();
+
+                ui.label("Decayed before");
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.sat_search.decay_date)
+                        .hint_text("yyyy-mm-dd"),
+                );
+                ui.end_row();
+            });
+        if ui.button("Clear filters").clicked() {
+            self.sat_search.object_name.clear();
+            self.sat_search.norad_cat_id.clear();
+            self.sat_search.rcs_size = 0;
+            self.sat_search.site.clear();
+            self.sat_search.country_code.clear();
+            self.sat_search.launch_date.clear();
+            self.sat_search.decay_date.clear();
+        }
+
+        // if input key changed (!= last_filter_key), reset the page and re-run the search
+        let key = self.sat_search.filter_key();
+        if key != self.sat_search.last_filter_key {
+            self.sat_search.last_filter_key = key;
+            self.sat_search.page = 0;
+            self.run_catalog_search();
+        }
+
+        ui.add_space(4.0);
+        let page = self.sat_search.page;
+        let page_count = self.sat_search.page_count();
+        ui.horizontal(|ui| {
+            ui.label(format!(
+                "{} result(s) \u{2014} page {} of {}",
+                self.sat_search.total,
+                page + 1,
+                page_count
+            ));
+            if ui
+                .add_enabled(page > 0, egui::Button::new("\u{2039} Prev"))
+                .clicked()
+            {
+                self.sat_search.page -= 1;
+                self.run_catalog_search();
+            }
+            if ui
+                .add_enabled(page + 1 < page_count, egui::Button::new("Next \u{203a}"))
+                .clicked()
+            {
+                self.sat_search.page += 1;
+                self.run_catalog_search();
+            }
+        });
+
+        let mut pending_add: Option<StoredTle> = None;
+        egui::ScrollArea::vertical()
+            .min_scrolled_height(400.0)
+            .id_salt("sat-search-results")
+            .show(ui, |ui| {
+                for row in &self.sat_search.results {
+                    let add = ui
+                        .horizontal(|ui| {
+                            let clicked = ui.small_button("Select").clicked();
+                            ui.label(format!("{}  #{}", row.object_name, row.norad_cat_id));
+                            clicked
+                        })
+                        .inner;
+                    if add {
+                        pending_add = Some(row.clone());
+                    }
+                    ui.label(
+                        egui::RichText::new(format!(
+                            "    {} \u{b7} RCS {} \u{b7} {} \u{b7} site {} \u{b7} launched {}{}",
+                            dash_if_blank(&row.object_type),
+                            dash_if_blank(&row.rcs_size),
+                            dash_if_blank(&row.country_code),
+                            dash_if_blank(&row.site),
+                            dash_if_blank(&row.launch_date),
+                            if row.decay_date.is_empty() {
+                                String::new()
+                            } else {
+                                format!(" \u{b7} decayed {}", row.decay_date)
+                            },
+                        ))
+                        .small()
+                        .weak(),
+                    );
+                }
+            });
+        if let Some(row) = pending_add {
+            if row.line1.trim().is_empty() || row.line2.trim().is_empty() {
+                self.set_error(format!("{} has no TLE lines stored", row.object_name));
+            } else {
+                // Load the result to see the TLE lines before Add satellite
+                self.new_satellite_preset = None;
+                self.new_satellite_name = row.object_name.clone();
+                self.new_tle_line1 = row.line1;
+                self.new_tle_line2 = row.line2;
+                self.set_status(format!(
+                    "{} loaded into \"Add satellite\" \u{2014} press \"Add satellite\" to track it",
+                    row.object_name
+                ));
+            }
         }
     }
 
@@ -2793,8 +3273,6 @@ impl IgrfApp {
                 }
             });
 
-            // `ProcessedData` carries |error| for C# parity, which cannot tell
-            // overshoot from undershoot; recompute the signed value for display.
             let error = self.pid_settings[axis].setpoint - self.filtered[axis];
             let error_percent = [
                 self.processed.error_per_x,
@@ -3153,9 +3631,6 @@ impl eframe::App for IgrfApp {
                             egui::CollapsingHeader::new("Config / logging")
                                 .default_open(true)
                                 .show(ui, |ui| self.show_config_panel(ui));
-                            egui::CollapsingHeader::new("Manual WMM2025 calculator")
-                                .default_open(false)
-                                .show(ui, |ui| self.show_manual_panel(ui));
                         });
                     });
                 egui::CentralPanel::default().show(ui, |ui| {
@@ -3185,12 +3660,12 @@ impl eframe::App for IgrfApp {
                             egui::CollapsingHeader::new("Time")
                                 .default_open(true)
                                 .show(ui, |ui| self.show_time_panel(ui));
+                            egui::CollapsingHeader::new("Manual Magnetism Calculator")
+                                .default_open(true)
+                                .show(ui, |ui| self.show_manual_panel(ui));
                             egui::CollapsingHeader::new("Satellite Position")
                                 .default_open(true)
                                 .show(ui, |ui| self.show_satellite_panel(ui));
-                            // egui::CollapsingHeader::new("Manual WMM2025 calculator")
-                            //     .default_open(true)
-                            //     .show(ui, |ui| self.show_manual_panel(ui));
                         });
                     });
                 egui::CentralPanel::default().show(ui, |ui| {
@@ -3230,6 +3705,45 @@ impl LinkState {
 
 fn fits_columns(ui: &egui::Ui, count: usize) -> bool {
     ui.available_width() >= MIN_COLUMN_WIDTH * count as f32
+}
+
+/// The element set stored in `tle_data.db` for this catalog number, if "Update
+/// TLE Info" has fetched it before. Any problem - no database yet, unreadable,
+/// nothing stored - is flattened to `None` so a broken file never keeps the
+/// baked-in presets from loading.
+fn stored_tle(catalog: u64) -> Option<StoredTle> {
+    // Reading must never create the database: a user who never fetches should
+    // get nothing in their working directory.
+    if !std::path::Path::new(TLE_STORE_PATH).exists() {
+        return None;
+    }
+    let mut store = TleStore::open(TLE_STORE_PATH).ok()?;
+    store.get(catalog).ok().flatten()
+}
+
+/// The NORAD catalog number in field 2 of a TLE line 1 (`1 25544U ...` -> 25544),
+/// if it parses.
+fn catalog_of(line1: &str) -> Option<u64> {
+    TleSet::new(line1.trim(), "").catalog_number().ok()
+}
+
+/// `"-"` for an empty catalog field, the value itself otherwise.
+fn dash_if_blank(value: &str) -> &str {
+    if value.trim().is_empty() {
+        "-"
+    } else {
+        value
+    }
+}
+
+/// Worker body for the catalog search's "Fetch data": log in to Space-Track,
+/// fetch every object of `gp_type` (`PAYLOAD` / `ROCKET BODY` / ...), and upsert
+/// them into `tle_data.db`. Returns the row count; failures are flattened to a
+/// message the panel can show.
+fn run_type_fetch(gp_type: &str) -> Result<usize, String> {
+    let credentials = Credentials::from_env().map_err(|error| error.to_string())?;
+    let mut store = TleStore::open(TLE_STORE_PATH).map_err(|error| error.to_string())?;
+    fetch_object_type(&credentials, &mut store, gp_type).map_err(|error| error.to_string())
 }
 
 /// An open port that stopped delivering packets leaves the last reading in
